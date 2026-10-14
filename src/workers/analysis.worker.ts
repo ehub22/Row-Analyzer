@@ -1,6 +1,12 @@
 import * as ort from "onnxruntime-web/webgpu";
-import wasmUrl from "../../node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.jsep.wasm?url";
-import wasmModule from "../../node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.jsep.mjs?url";
+import {
+  configureOrtRuntime,
+  ortWasmOnlyVariant,
+  ortWebGpuVariant,
+  probeWebGpuAdapter,
+  webGpuProviderLabel,
+  type GpuProbe,
+} from "../core/ortRuntime";
 import { decodeVideo } from "../core/video";
 import { decodeYolo, decodeYolox, paddedCrop } from "../core/detection";
 import { decodeSimCC, decodeHeatmap, unflip, fusePoses } from "../core/pose";
@@ -50,36 +56,30 @@ let activePool: PoseWorkerPool | null = null;
 interface LoadedModel {
   session: ort.InferenceSession;
   provider: "WebGPU" | "WASM";
+  /** Adapter description when running on the GPU, for the session record. */
+  gpuLabel?: string;
 }
 
-const webgpuAvailable = (): boolean => {
-  try {
-    return Boolean(
-      (globalThis as { navigator?: { gpu?: unknown } }).navigator?.gpu,
-    );
-  } catch {
-    return false;
-  }
-};
-
 /**
- * Creates a session, preferring WebGPU when allowed. A WebGPU session that
- * *creates* can still fail on its first real inference (unsupported operator,
- * buffer-size limits on large fp32 models, driver blocklists — seen on
- * Chrome/Linux/macOS, Firefox and Safari), so WebGPU candidates must pass a
- * warm-up inference with a zero tensor before any video is decoded. Any
- * failure falls back to WASM and is reported, never silently swallowed.
+ * Creates a session, preferring WebGPU when an adapter was probed successfully.
+ * A WebGPU session that *creates* can still fail on its first real inference
+ * (unsupported operator, buffer-size limits on large fp32 models, driver
+ * blocklists), so every WebGPU candidate must pass a warm-up inference with a
+ * zero tensor before any video is decoded. Any failure falls back to WASM and
+ * is reported, never silently swallowed.
  */
 async function loadModel(
   bytes: ArrayBuffer,
   name: string,
   opts: {
-    forceWasm: boolean;
+    /** False for Force WASM, or when the WebGPU probe found no adapter. */
+    allowWebGpu: boolean;
+    gpuLabel: string;
     probeDims: (session: ort.InferenceSession) => number[];
     notes: string[];
   },
 ): Promise<LoadedModel> {
-  if (!opts.forceWasm && webgpuAvailable()) {
+  if (opts.allowWebGpu) {
     try {
       const session = await ort.InferenceSession.create(bytes, {
         executionProviders: ["webgpu"],
@@ -97,7 +97,7 @@ async function loadModel(
         } finally {
           probe.dispose();
         }
-        return { session, provider: "WebGPU" };
+        return { session, provider: "WebGPU", gpuLabel: opts.gpuLabel };
       } catch (e) {
         await session.release().catch(() => {});
         throw e;
@@ -107,10 +107,6 @@ async function loadModel(
       opts.notes.push(note);
       send("status", note);
     }
-  } else if (!opts.forceWasm) {
-    opts.notes.push(
-      `WebGPU is not exposed by this browser (navigator.gpu missing); using WASM for ${name}.`,
-    );
   }
   return {
     session: await ort.InferenceSession.create(bytes, {
@@ -246,20 +242,51 @@ async function run(job: Job) {
   const plan: ParallelPlan =
     job.parallel ??
     planParallelism(readParallelEnv(), job.settings.workers);
-  // ORT reads wasmPaths/numThreads when the WASM backend initialises (first
-  // session in this worker). Threaded WASM only engages on cross-origin-
-  // isolated pages; planParallelism already caps threads at 1 otherwise.
-  ort.env.wasm.numThreads = plan.detectorThreads;
-  ort.env.wasm.wasmPaths = { wasm: wasmUrl, mjs: wasmModule };
-
   const notes: string[] = [];
   send("status", "Loading detector and whole-body pose model…");
   send("status", `Parallel plan: ${summarizePlan(plan)}.`);
 
+  // WebGPU is probed before any model is touched: "navigator.gpu exists" is
+  // not the same as "an adapter is available", and the reason has to reach the
+  // user. The probed adapter is handed to ONNX Runtime so that it does not ask
+  // for a second, possibly different, one.
+  let gpu: GpuProbe | null = null;
+  if (job.settings.wasm) {
+    notes.push(
+      "Force WASM compatibility mode is on: WebGPU is not attempted for this run.",
+    );
+  } else {
+    gpu = await probeWebGpuAdapter();
+    if (gpu.kind === "adapter" && gpu.adapter) {
+      (ort.env.webgpu as { adapter?: unknown }).adapter = gpu.adapter;
+      notes.push(gpu.reason);
+      send("status", gpu.reason);
+    } else {
+      notes.push(`WebGPU is unavailable: ${gpu.reason}`);
+    }
+  }
+  const allowWebGpu = Boolean(gpu && gpu.kind === "adapter");
+  const gpuLabel = gpu ? webGpuProviderLabel(gpu) : "WebGPU";
+
+  // ORT reads wasmPaths/numThreads when the WASM runtime initialises (first
+  // session in this worker), so the choice is made after the probe:
+  //  * WebGPU runs on the asyncify build — the only one that carries the
+  //    native WebGPU bridge (`webgpuInit`) that `onnxruntime-web/webgpu`
+  //    calls. Pinning a build without it is what made every GPU run fail with
+  //    "webgpuInit is not a function" on every device and browser.
+  //  * Runs that cannot use WebGPU load the plain build instead: smaller
+  //    (~14 MB vs ~27 MB) and free of asyncify overhead in the WASM pool.
+  configureOrtRuntime(
+    ort.env,
+    allowWebGpu ? ortWebGpuVariant : ortWasmOnlyVariant,
+    plan.detectorThreads,
+  );
+
   const detectorBytes = await job.detector.arrayBuffer();
   const poseBytes = await job.pose.arrayBuffer();
   const d = await loadModel(detectorBytes, job.detector.name, {
-    forceWasm: job.settings.wasm,
+    allowWebGpu,
+    gpuLabel,
     probeDims: (s) => probeDimsFrom(s, [1, 3, 640, 640]),
     notes,
   });
@@ -273,16 +300,17 @@ async function run(job: Job) {
   let poolAlive = false;
   let poseProvider = "";
 
-  if (!job.settings.wasm && webgpuAvailable()) {
+  if (allowWebGpu) {
     const attempt = await loadModel(poseBytes, job.pose.name, {
-      forceWasm: false,
+      allowWebGpu: true,
+      gpuLabel,
       probeDims: (s) =>
         probeDimsFrom(s, [1, 3, job.settings.height, job.settings.width]),
       notes,
     });
     if (attempt.provider === "WebGPU") {
       localPose = attempt;
-      poseProvider = "WebGPU";
+      poseProvider = gpuLabel;
     } else {
       // loadModel already fell back to a WASM session; keep it only as the
       // emergency fallback and prefer the pool for actual inference.
@@ -357,7 +385,8 @@ async function run(job: Job) {
     }
     if (!poolAlive && !localPose) {
       localPose = await loadModel(poseBytes, job.pose.name, {
-        forceWasm: true,
+        allowWebGpu: false,
+        gpuLabel,
         probeDims: (s) =>
           probeDimsFrom(s, [1, 3, job.settings.height, job.settings.width]),
         notes,
@@ -393,13 +422,45 @@ async function run(job: Job) {
     if (size !== shape[3] && typeof shape[3] === "number")
       throw Error("Detector must have a square NCHW input.");
 
+    // A GPU session can also die *during* a run (device lost, driver reset,
+    // out of memory on a large frame). Throwing away thousands of decoded
+    // frames is the wrong answer: rebuild that session on WASM, say so, and
+    // keep going. Rebuilding needs a fresh input tensor because the failed
+    // attempt disposed it, hence the factory argument.
+    let detectorSession = d.session;
+    let detectorProvider = d.provider;
+    let detectorLabel = d.provider === "WebGPU" ? (d.gpuLabel ?? "WebGPU") : d.provider;
+    const runDetector = async (makeInput: () => ort.Tensor) => {
+      try {
+        return await infer(detectorSession, makeInput());
+      } catch (e) {
+        if (detectorProvider !== "WebGPU") throw e;
+        notes.push(
+          `The GPU detector session failed mid-analysis (${errText(e)}); continuing on WASM for the rest of this run.`,
+        );
+        send("status", "GPU detector session failed; continuing on WASM.");
+        await detectorSession.release().catch(() => {});
+        const fallback = await loadModel(detectorBytes, job.detector.name, {
+          allowWebGpu: false,
+          gpuLabel,
+          probeDims: (session) => probeDimsFrom(session, [1, 3, 640, 640]),
+          notes,
+        });
+        detectorSession = fallback.session;
+        detectorProvider = "WASM";
+        detectorLabel = "WASM";
+        return await infer(detectorSession, makeInput());
+      }
+    };
+
     // Memoised so concurrent pool failures create exactly one fallback.
     let localPosePromise: Promise<LoadedModel> | null = null;
     const ensureLocalPose = async (): Promise<LoadedModel> => {
       if (localPose) return localPose;
       localPosePromise ??= (async () => {
         const m = await loadModel(poseBytes, job.pose.name, {
-          forceWasm: true,
+          allowWebGpu: false,
+          gpuLabel,
           probeDims: (s) =>
             probeDimsFrom(s, [1, 3, job.settings.height, job.settings.width]),
           notes,
@@ -415,6 +476,26 @@ async function run(job: Job) {
       })();
       localPose = await localPosePromise;
       return localPose;
+    };
+
+    // Single-flight downgrade used when the local pose session dies mid-run
+    // (device lost, driver reset). TTA passes run concurrently, so several
+    // passes can observe the same failure: they all wait on one rebuild
+    // instead of each releasing the dead session and loading another model.
+    let poseFallback: Promise<LoadedModel> | null = null;
+    const fallbackToWasmPose = (dead: LoadedModel): Promise<LoadedModel> => {
+      poseFallback ??= (async () => {
+        notes.push(
+          `The GPU pose session failed mid-analysis; continuing on WASM for the rest of this run. Speed is reduced.`,
+        );
+        send("status", "GPU pose session failed; continuing on WASM.");
+        await dead.session.release().catch(() => {});
+        if (localPose === dead) localPose = null;
+        localPosePromise = null;
+        poseProvider = `WASM (${plan.detectorThreads} thread${plan.detectorThreads === 1 ? "" : "s"} after GPU loss)`;
+        return ensureLocalPose();
+      })();
+      return poseFallback;
     };
 
     /** Runs one crop/TTA pass, on the pool when active, else locally. */
@@ -454,14 +535,27 @@ async function run(job: Job) {
           await ensureLocalPose();
         }
       }
-      const session = (await ensureLocalPose()).session;
-      const outputs = await infer(
-        session,
-        tensor(frame, job.settings.width, job.settings.height, crop, flip, "pose"),
-      );
+      let model = await ensureLocalPose();
+      let outputs: Record<string, ort.Tensor>;
+      try {
+        outputs = await infer(
+          model.session,
+          tensor(frame, job.settings.width, job.settings.height, crop, flip, "pose"),
+        );
+      } catch (e) {
+        // A GPU session lost mid-run must not abort the analysis: rebuild it
+        // on WASM and redo this pass. A WASM session that fails is a real
+        // error and stays fatal.
+        if (model.provider !== "WebGPU") throw e;
+        model = await fallbackToWasmPose(model);
+        outputs = await infer(
+          model.session,
+          tensor(frame, job.settings.width, job.settings.height, crop, flip, "pose"),
+        );
+      }
       try {
         return decodePoseOutputs(
-          session,
+          model.session,
           outputs,
           job.settings.format,
           crop,
@@ -486,13 +580,12 @@ async function run(job: Job) {
           throw Error(
             "Clip exceeds the 20,000-frame memory guard. Analyze shorter clips.",
           );
-        const out = await infer(
-          d.session,
+        const out = await runDetector(() =>
           tensor(frame, size, size, null, false, job.settings.detector),
         );
         let boxes: Box[];
         try {
-          const raw = out[d.session.outputNames[0]];
+          const raw = out[detectorSession.outputNames[0]];
           const ratio = Math.min(
             size / frame.displayWidth,
             size / frame.displayHeight,
@@ -587,13 +680,15 @@ async function run(job: Job) {
         "3D camera normalization, oar tracking, and depth-dependent biomechanics are not validated and are withheld.",
       ],
       model: `${job.detector.name} + ${job.pose.name}; ${job.settings.width}×${job.settings.height}; ${job.settings.tta ? "flip + multi-scale TTA" : "single pass"}`,
-      provider: `${d.provider} detector / ${poseProvider} pose`,
+      // Provider strings carry the adapter description when the GPU was used,
+      // so an exported session records what actually ran where.
+      provider: `${detectorLabel} detector / ${poseProvider} pose`,
     };
     send("result", session);
   } finally {
     pool?.dispose();
     activePool = null;
-    await d.session.release();
+    await d.session.release().catch(() => {});
     if (localPose) await localPose.session.release();
   }
 }

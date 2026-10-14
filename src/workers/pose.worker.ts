@@ -8,6 +8,9 @@
 // unavailable or fails, and N CPU sessions scale across cores without any
 // cross-origin-isolation requirement. If WebGPU does work, the coordinator
 // keeps pose inference on the GPU itself and never initialises this pool.
+// For that reason this worker imports the WASM-only entry point and pins the
+// plain WASM build (no WebGPU bridge, no asyncify overhead) — see
+// core/ortRuntime.ts for why the entry point and the WASM build must match.
 //
 // Protocol (over the MessagePort), implemented by core/pool.ts:
 //   in   { type: "init", poseBytes, format, width, height, wasmThreads }
@@ -15,9 +18,11 @@
 //   out  { type: "ready" } | { type: "init-error", error }
 //        { type: "pose-result", id, points } | { type: "pose-error", id, error }
 
-import * as ort from "onnxruntime-web/webgpu";
-import wasmUrl from "../../node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.jsep.wasm?url";
-import wasmModule from "../../node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.jsep.mjs?url";
+import * as ort from "onnxruntime-web/wasm";
+import {
+  configureOrtRuntime,
+  ortWasmOnlyVariant,
+} from "../core/ortRuntime";
 import { decodeSimCC, decodeHeatmap, unflip } from "../core/pose";
 import { checkPoseContract } from "../core/compat";
 import type { Box, Point } from "../core/types";
@@ -53,8 +58,7 @@ async function init(msg: InitMessage): Promise<void> {
     // Threaded WASM only engages when the page is cross-origin isolated;
     // core/parallel.ts already caps this at 1 otherwise, and ORT would
     // silently clamp it anyway. Set before the first session is created.
-    ort.env.wasm.numThreads = Math.max(1, Math.floor(msg.wasmThreads) || 1);
-    ort.env.wasm.wasmPaths = { wasm: wasmUrl, mjs: wasmModule };
+    configureOrtRuntime(ort.env, ortWasmOnlyVariant, msg.wasmThreads);
     session = await ort.InferenceSession.create(
       await msg.poseFile.arrayBuffer(),
       { executionProviders: ["wasm"] },

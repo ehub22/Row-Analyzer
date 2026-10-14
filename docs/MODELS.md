@@ -68,7 +68,22 @@ Each ONNX session also runs a shape-level contract check when it is created (`sr
 
 ## Browser runtime
 
-WebGPU is attempted first (unless *Force WASM* is set) and must pass a warm-up inference on a zero tensor before any frame is decoded: sessions that create successfully can still fail on the first real run (unsupported operators, GPU buffer limits on large fp32 models, driver blocklists), and that failure now falls back to WASM automatically with the reason recorded in the session warnings instead of aborting the analysis. This matters in practice — WebGPU adapter creation fails outright on many Chrome-on-Linux, Firefox, and Safari setups.
+WebGPU is attempted first (unless *Force WASM* is set) and must pass a warm-up inference on a zero tensor before any frame is decoded: sessions that create successfully can still fail on the first real run (unsupported operators, GPU buffer limits on large fp32 models, driver blocklists), and that failure falls back to WASM automatically with the reason recorded in the session warnings instead of aborting the analysis. Adapter creation fails outright on many Chrome-on-Linux, Firefox, and Safari setups, so the reason is always recorded and shown: no `navigator.gpu`, no adapter at all, only a software adapter, or a specific ONNX Runtime error.
+
+### WASM build selection (this was the "GPU never works" bug)
+
+ONNX Runtime Web ships one JavaScript entry point per execution-provider set, and **each entry expects exactly one of the prebuilt WASM modules**. The pairing is compiled into the entry, not chosen at runtime:
+
+| Entry point | WASM module it loads | Exposes the WebGPU bridge |
+| --- | --- | --- |
+| `onnxruntime-web/webgpu` | `ort-wasm-simd-threaded.asyncify` | yes (`webgpuInit`) |
+| `onnxruntime-web` / `/all` | `ort-wasm-simd-threaded.jsep` | no |
+| `onnxruntime-web/wasm` | `ort-wasm-simd-threaded` | no |
+| `onnxruntime-web/jspi` | `ort-wasm-simd-threaded.jspi` | yes (`webgpuInit`) |
+
+The app previously pinned the **jsep** module via `env.wasm.wasmPaths` while importing the **webgpu** entry, which asks the module for `webgpuInit` — a function that only exists in the asyncify/jspi builds. Result: `WebGPU failed for <model> (no available backend found. ERR: [webgpu] TypeError: ...webgpuInit is not a function)` on every browser and device, because it was a static file mismatch, not a hardware limit. `src/core/ortRuntime.ts` now pins the matching pair, `tests/ortRuntime.test.ts` re-derives the table above from the installed package and fails if an upgrade changes it, and WebGPU runs use the asyncify build while WASM-only runs use the smaller plain build (about 14 MB instead of 27 MB, and no asyncify overhead in the WASM pool).
+
+A probed adapter is passed to ONNX Runtime through `env.webgpu.adapter`, so the library does not request a second, possibly different adapter. A *software* adapter (SwiftShader) is detected and reported; it is not used by default because the parallel WASM pool is usually faster. If a GPU session dies mid-run, that session is rebuilt on WASM and the run continues with a recorded warning instead of discarding the decoded frames.
 
 WASM inference is parallelised two ways (see `src/core/parallel.ts` for the exact policy):
 

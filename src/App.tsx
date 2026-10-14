@@ -1121,6 +1121,11 @@ function App() {
                     <LockKeyhole size={11} /> Processed on your device. Never
                     uploaded.
                   </p>
+                  {session && !session.demo && (
+                    <p className="runtime-line">
+                      <Cpu size={11} /> Runtime: {session.provider}
+                    </p>
+                  )}
                 </aside>
               </div>
               {tab === "Keyframe labels" ? (
@@ -1772,10 +1777,12 @@ function App() {
                   <span>
                     <strong>Force WASM compatibility mode</strong>
                     <small>
-                      Otherwise WebGPU is requested and probed with a warm-up
-                      run; if it fails — as it does for these models on many
-                      Chrome/Firefox/Safari setups — analysis automatically
-                      falls back to the parallel WASM worker pool.
+                      Otherwise a GPU adapter is probed and every model session
+                      must pass a warm-up run before decoding. If the browser
+                      has no adapter or a session fails — including a GPU lost
+                      mid-analysis — the run continues on the parallel WASM
+                      worker pool and says why in the analysis notes. The
+                      runtime used is shown under the Analyze button.
                     </small>
                   </span>
                 </label>

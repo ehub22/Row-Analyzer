@@ -1,10 +1,7 @@
 import { chromium } from "playwright";
-import chrome from "@sparticuz/chromium";
-const browser = await chromium.launch({
-  executablePath: await chrome.executablePath(),
-  args: chrome.args,
-  headless: true,
-});
+import { resolveChromium } from "./lib/chromium.mjs";
+const { executablePath, args, env } = await resolveChromium();
+const browser = await chromium.launch({ executablePath, args, env, headless: true });
 const page = await browser.newPage();
 await page.goto("http://localhost:5173");
 for (const name of ["1.mov", "3.mov"]) {
