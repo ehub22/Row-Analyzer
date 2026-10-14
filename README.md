@@ -43,11 +43,11 @@ npm run test:e2e       # production-browser workflow tests
 ## Use
 
 1. Import a short MP4/MOV clip (up to 300 MB, 20,000 decoded-frame guard). Choose the shell, rigging, seat count, best-visible seat, and bow direction in the image.
-2. Open **Models & settings**. When the build has model URLs configured, the detector and whole-body models download automatically on the first analysis (with progress) and are cached in this browser. Otherwise import compatible ONNX files from your device. Set input dimensions/format to match the export. Enable flip/multi-scale TTA for four passes per crop.
+2. Open **Models & settings** and import a compatible detector and whole-body ONNX model. Set input dimensions/format to match the export. Enable flip/multi-scale TTA for four passes per crop.
 3. If needed, use the detection-region percentage bounds to exclude bystanders/coxswain detection centers. This is a static region; the crew must stay inside it.
 4. Analyze. All decoded frames are submitted. Initialization stops if detected people do not match configured seats, rather than silently assigning incorrect identities.
 5. Verify identity, observations, and occlusion. Use **Keyframe labels** to correct only visible joints. Select a joint and click to add a missing observation, or drag an existing point.
-6. Export your session/report before starting a new session. Nothing is stored persistently automatically. To restore, open the JSON then import the original video with the same filename. Model weights (never video or keypoints) may be cached by the browser; remove them with *Clear cached models*.
+6. Export your session/report before starting a new session. Nothing is stored persistently automatically. To restore, open the JSON then import the original video with the same filename. Model files are also session-local.
 7. Open **Compare** and import another exported JSON session. Current comparison is aggregate timing, not normalized 3D technique.
 
 The synthetic demo works without model downloads and is always marked as synthetic in the UI and exports.

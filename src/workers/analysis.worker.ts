@@ -5,7 +5,6 @@ import { decodeVideo } from "../core/video";
 import { decodeYolo, decodeYolox, paddedCrop } from "../core/detection";
 import { decodeSimCC, decodeHeatmap, unflip, fusePoses } from "../core/pose";
 import { SeatTracker } from "../core/tracking";
-import { checkDetectorContract, checkPoseContract } from "../core/compat";
 import { recoverOcclusion } from "../core/occlusion";
 import { segmentStrokes } from "../core/strokes";
 import { estimateCamera } from "../core/geometry";
@@ -110,24 +109,8 @@ async function run(job: Job) {
   try {
     p = await model(job.pose, job.settings.wasm);
     const poseSession = p.session;
-    const tensorShape = (m: {
-      isTensor: boolean;
-      shape?: readonly (number | string)[];
-    }) => (m.isTensor && m.shape ? m.shape : []);
-    const detectorIn = tensorShape(d.session.inputMetadata[0]);
-    const detectorOut = tensorShape(d.session.outputMetadata[0]);
-    const poseIn = tensorShape(poseSession.inputMetadata[0]);
-    const poseOuts = poseSession.outputMetadata.map(tensorShape);
-    // Fail fast on contract mismatches before decoding any frame.
-    checkDetectorContract(detectorIn, detectorOut, job.settings.detector);
-    checkPoseContract(
-      poseIn,
-      poseOuts,
-      job.settings.format,
-      job.settings.width,
-      job.settings.height,
-    );
-    const shape = detectorIn;
+    const detectorMeta = d.session.inputMetadata[0];
+    const shape = detectorMeta.isTensor ? detectorMeta.shape : [];
     const size = typeof shape[2] === "number" ? shape[2] : 640;
     if (size !== shape[3] && typeof shape[3] === "number")
       throw Error("Detector must have a square NCHW input.");
