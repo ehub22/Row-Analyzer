@@ -1,0 +1,15 @@
+node_modules/
+dist/
+.cache/
+.venv/
+__pycache__/
+google_drive/
+private/
+*.onnx
+*.onnx.data
+*.mp4
+*.mov
+playwright-report/
+test-results/
+
+*.tsbuildinfo

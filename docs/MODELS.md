@@ -1,0 +1,65 @@
+# Model setup and accuracy contract
+
+## Bring authentic weights
+
+The app imports local `.onnx` files; it does not execute Python or send video to model servers. Get models from official upstream projects and review the applicable code, data, and weight licenses before use or redistribution:
+
+- DWPose: https://github.com/IDEA-Research/DWPose
+- MMPose RTMPose / RTMW: https://github.com/open-mmlab/mmpose/tree/main/projects/rtmpose
+- ViTPose: https://github.com/ViTAE-Transformer/ViTPose
+- Sapiens: https://github.com/facebookresearch/sapiens
+- YOLOX: https://github.com/Megvii-BaseDetection/YOLOX
+
+**Recommended initial browser evaluation pair:** YOLOX-L `yolox_l.onnx` plus DWPose `dw-ll_ucoco_384.onnx`. This is a practical whole-body baseline, not proof it is the most accurate rowing model. RTMW-x high-resolution and whole-body ViTPose large/huge should be benchmarked against it before selecting a production model. Do not substitute a COCO-17 body checkpoint.
+
+## Supported contracts
+
+### YOLOX
+- Input float32 NCHW `[1,3,S,S]`, square fixed input (usually 640).
+- Raw **BGR** 0–255; top-left letterbox with padding value 114.
+- Output `[1,N,85]`: raw grid-relative x/y and log-width/height, objectness and 80 class scores; person class index 0.
+- Strides 8/16/32; decode, confidence threshold 0.35, NMS IoU 0.45.
+- A graph with already-decoded coordinates is **not** compatible with this adapter.
+
+### YOLOv8 / YOLO11 (optional detector adapter)
+- RGB 0–1, square NCHW input, top-left letterbox.
+- Output `[1,84,N]` with decoded center-x/y/width/height and class scores; no objectness channel, no embedded NMS.
+- End-to-end `[1,N,6]` or YOLO26 exports are rejected.
+- Review Ultralytics licensing separately; weights are not bundled here.
+
+### DWPose / compatible RTMW SimCC
+- Input `[1,3,H,W]`; default **W=288, H=384**, RGB.
+- Mean `[123.675,116.28,103.53]`, standard deviation `[58.395,57.12,57.375]`.
+- Two outputs in x-then-y order: `[1,133,2W]`, `[1,133,2H]` (dimension-derived scale also supported).
+- COCO-WholeBody order: 17 body, 6 feet, 68 face, 21 left hand, 21 right hand. No inserted OpenPose neck.
+- Argmax plus local parabolic sub-pixel refinement. Confidence uses minimum axis peak clipped to [0,1], not a calibrated probability. Different SimCC training normalizations require empirical threshold calibration.
+
+### Whole-body heatmap exports
+- Same image preprocessing; one `[1,133,Hh,Wh]` heatmap tensor.
+- Peak + local 2D parabolic refinement and inverse crop mapping.
+- The export must match the exact non-UDP coordinate convention. Generic ViTPose body checkpoints/UDP exports are not automatically compatible.
+- Current TTA fuses **decoded coordinates**, weighted by confidence, and penalizes inter-pass disagreement. It does **not** yet perform full heatmap-space multi-scale fusion or DARK refinement.
+
+### TTA
+Two crop scales (1.25, 1.5) × original/flipped input. Preserve aspect ratio and swap all body, foot, facial, and hand mirror indices. Keep per-joint provenance and confidence. Padded crops extend beyond the image with black padding. Per-frame detection plus per-person four-pass pose inference is deliberately slow.
+
+## Browser runtime
+
+WebGPU is attempted during model session creation, with WASM fallback if creation fails. Errors during inference are reported; the app does not silently replace the model. Model weights stay in memory for the session, not IndexedDB. WASM is single-threaded for GitHub Pages compatibility. Large/huge transformers may exceed GPU/storage-buffer/browser memory limits; compatible ONNX operators alone do not guarantee feasibility.
+
+## Optional local GPU companion — proposed, not implemented
+
+A useful higher-accuracy extension is an offline Python CLI (not a public video-upload service):
+
+1. Decode presentation timestamps with PyAV.
+2. Use PyTorch/MMPose or ONNX Runtime CUDA for RTMDet/YOLOX + RTMW-x or compatible whole-body ViTPose/Sapiens models.
+3. Fuse spatial distributions over flips and scales; retain raw outputs for QA.
+4. Apply calibrated camera estimation plus a rowing-adapted temporal 3D model.
+5. Export the versioned session JSON described in `src/core/types.ts`; optional 3D data must add explicit coordinate-frame/camera/model provenance in a future schema version.
+6. Import the JSON and original clip into this browser review UI.
+
+This avoids mixed-content/localhost problems on an HTTPS Pages site. If a future live companion API is added, require explicit opt-in, a loopback-only service, authenticated requests, restricted origins and a same-origin local proxy. Do not expose a GPU inference service to the network by default.
+
+## Labeling and adaptation
+
+Export keyframe labels after correcting visible joints. The export is **partial COCO-style**, not a complete ready-to-train COCO dataset: it contains video filename, frame timestamp, seat, box, joint names and only manually placed points with visibility 2. Unlabeled and inferred points have visibility 0. Extract the matching frames locally and add image IDs/license/consent metadata before training. Split evaluation by athlete, crew and recording session. Never count adjacent frames or propagated coordinates as independent human ground truth.
