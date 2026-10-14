@@ -56,6 +56,25 @@ The sandbox's Chromium decoder omitted the sample at 0.033333 s in each clip. Th
 
 The official model-download hosts (and GitHub LFS media redirects) were outside this environment's permitted outbound hosts. Attempts to retrieve the DWPose pretrained checkpoint failed; a pointer file was not misrepresented as weights. Users can import authentic compatible ONNX weights on their own machine.
 
+## Model download, cache and compatibility update
+
+Implemented: automatic streamed download with progress for the detector and whole-body ONNX models, Cache Storage reuse with exact-size and ONNX-header checks and corrupt-entry eviction, a *Clear cached models* action, local-file fallback at every stage, and shape-level I/O contract checks on the created ONNX sessions.
+
+Drive metadata (checked through the user's connection, not byte-verified here):
+
+| Drive file | Size in bytes | Hash |
+| --- | --- | --- |
+| `yolox_l.onnx` | 216,746,733 | not recorded |
+| `dw-ll_ucoco_384.onnx` | 134,399,116 | not recorded |
+
+**Not validated in this update:**
+
+- The Drive ONNX files were **not** retrieved. The sandbox cannot reach Google Drive directly, and Arena's connector refuses transfers over 100 MiB, so neither file reached the workspace. Their I/O graphs, opset, and dynamic-shape behavior are therefore **unverified**. The 216 MB / 134 MB sizes are consistent with full-precision YOLOX-L and DWPose-l exports but do not prove it.
+- Pose tracking was **not** validated with real weights. The only inference run used the generated constant test doubles on a synthetic H.264 clip. This exercised download, cache, fallback, the contract checks and the worker pipeline end to end. It says nothing about detection or joint accuracy.
+- No public, CORS-readable download URL has been configured. Until `VITE_YOLOX_URL` and `VITE_DWPOSE_URL` are set, the auto-download path reports *No download URL* and users must import the files.
+
+Automated checks run for this update: 46 unit tests (including the streamed download, truncated/HTML payload rejection, SHA-256 mismatch, abort, cache eviction and the I/O contract cases); the 6 production browser tests; and a browser run that auto-downloaded both test doubles, reloaded with the cache, cleared the cache, recovered from a forced download failure via local files, and completed analysis with no page errors.
+
 ## Remaining release gates
 
 1. Retrieve licensed reference detector + whole-body weights, verify hashes/contracts and test GPU/WASM agreement on actual pixels.

@@ -22,6 +22,12 @@ jobs:
       - run: npm ci
       - run: npm test
       - run: npm run build
+        env:
+          # Public model URLs (repository variables). Weights are never stored in Git.
+          VITE_YOLOX_URL: ${{ vars.VITE_YOLOX_URL }}
+          VITE_DWPOSE_URL: ${{ vars.VITE_DWPOSE_URL }}
+          VITE_YOLOX_BYTES: ${{ vars.VITE_YOLOX_BYTES }}
+          VITE_DWPOSE_BYTES: ${{ vars.VITE_DWPOSE_BYTES }}
       - run: npx playwright install --with-deps chromium
       - run: npm run test:e2e
       - uses: actions/upload-pages-artifact@v3

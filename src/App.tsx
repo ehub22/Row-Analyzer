@@ -41,6 +41,27 @@ import { createDemo } from "./core/demo";
 import { mean, segmentStrokes, crewTiming } from "./core/strokes";
 import { applyCorrection } from "./core/occlusion";
 import {
+  modelSpecs,
+  downloadModel,
+  getCachedModel,
+  isModelCached,
+  clearModelCache,
+  ModelLoadError,
+  type ModelId,
+} from "./core/modelCache";
+type ModelState = {
+  state: "missing" | "checking" | "cached" | "downloading" | "ready" | "error";
+  received: number;
+  total: number;
+  source?: "cache" | "download";
+  error?: string;
+};
+const initialModelState = (): Record<ModelId, ModelState> => ({
+  detector: { state: "checking", received: 0, total: 0 },
+  pose: { state: "checking", received: 0, total: 0 },
+});
+const mb = (n: number) => `${(n / 1048576).toFixed(1)} MB`;
+import {
   exportJSON,
   exportCSV,
   exportPDF,
@@ -87,10 +108,15 @@ function App() {
     [settings, setSettings] = useState<ModelSettings>(defaultModels),
     [detector, setDetector] = useState<File | null>(null),
     [pose, setPose] = useState<File | null>(null),
+    [modelState, setModelState] =
+      useState<Record<ModelId, ModelState>>(initialModelState),
     [progress, setProgress] = useState<number | null>(null),
     [status, setStatus] = useState(""),
     [joint, setJoint] = useState(9),
     [baseline, setBaseline] = useState<Session | null>(null);
+  const resolvedModels = useRef<Partial<Record<ModelId, File>>>({}),
+    downloadAbort = useRef<AbortController | null>(null),
+    runToken = useRef(0);
   const upload = useRef<HTMLInputElement>(null),
     importSession = useRef<HTMLInputElement>(null),
     importCompare = useRef<HTMLInputElement>(null),
@@ -118,6 +144,32 @@ function App() {
     const t = setTimeout(() => setToast(""), 4500);
     return () => clearTimeout(t);
   }, [toast]);
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      for (const id of ["detector", "pose"] as const) {
+        const spec = modelSpecs[id];
+        let next: ModelState;
+        if (await isModelCached(spec)) {
+          const f = await getCachedModel(spec);
+          next = f
+            ? {
+                state: "cached",
+                received: f.size,
+                total: f.size,
+                source: "cache",
+              }
+            : { state: "missing", received: 0, total: spec.bytes };
+        } else {
+          next = { state: "missing", received: 0, total: spec.bytes };
+        }
+        if (alive) setModelState((m) => ({ ...m, [id]: next }));
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, []);
   useEffect(() => {
     if (!modal) return;
     const previous = document.activeElement as HTMLElement | null;
@@ -203,13 +255,106 @@ function App() {
     });
     setSeat(def.seats);
   }
-  function run() {
+  /** Local file (user choice) > Cache Storage > streamed download. */
+  /** Local file (user choice) > Cache Storage > streamed download. */
+  async function resolveModel(id: ModelId, token: number): Promise<File> {
+    const local = id === "detector" ? detector : pose;
+    if (local) return local;
+    const known = resolvedModels.current[id];
+    if (known) return known;
+    return downloadOrCache(id, modelSpecs[id], token, true);
+  }
+  /**
+   * Single place where model state changes: cache hit -> ready, otherwise a
+   * streamed download with progress -> cached -> ready, or an error state.
+   * `inRun` also drives the analysis progress bar and status line.
+   */
+  async function downloadOrCache(
+    id: ModelId,
+    spec: (typeof modelSpecs)[ModelId],
+    token: number,
+    inRun: boolean,
+  ): Promise<File> {
+    const setState = (st: ModelState) =>
+      setModelState((m) => ({ ...m, [id]: st }));
+    try {
+      const cached = await getCachedModel(spec);
+      if (cached) {
+        resolvedModels.current[id] = cached;
+        setState({
+          state: "ready",
+          received: cached.size,
+          total: cached.size,
+          source: "cache",
+        });
+        if (inRun) setStatus(`${spec.fileName} loaded from cache.`);
+        return cached;
+      }
+      if (!spec.url)
+        throw new ModelLoadError(
+          `${spec.fileName} is not cached and this build has no download URL. Import it under Models & processing.`,
+        );
+      let lastPct = -1;
+      setState({ state: "downloading", received: 0, total: spec.bytes });
+      if (inRun) setStatus(`Downloading ${spec.fileName}…`);
+      downloadAbort.current = new AbortController();
+      const file = await downloadModel(
+        spec,
+        (received, total) => {
+          const pct = total ? Math.floor((received / total) * 100) : 0;
+          if (pct === lastPct) return;
+          lastPct = pct;
+          setState({ state: "downloading", received, total });
+          if (inRun && token === runToken.current) {
+            setStatus(
+              `Downloading ${spec.fileName} · ${pct}% (${mb(received)} of ${mb(total)})`,
+            );
+            setProgress(pct / 1000); // download occupies the first 10% of the bar
+          }
+        },
+        { signal: downloadAbort.current.signal },
+      );
+      if (token !== runToken.current && inRun)
+        throw new ModelLoadError("Canceled.");
+      resolvedModels.current[id] = file;
+      setState({
+        state: "ready",
+        received: file.size,
+        total: file.size,
+        source: "download",
+      });
+      if (inRun) setStatus(`${spec.fileName} downloaded and cached.`);
+      return file;
+    } catch (e) {
+      if (!(e instanceof ModelLoadError && e.message === "Canceled."))
+        setState({
+          state: "error",
+          received: 0,
+          total: spec.bytes,
+          error: e instanceof Error ? e.message : String(e),
+        });
+      throw e;
+    }
+  }
+  async function prepareModels(token: number) {
+    try {
+      const d = await resolveModel("detector", token);
+      const p = await resolveModel("pose", token);
+      return { d, p };
+    } catch (e) {
+      if (e instanceof ModelLoadError && e.message === "Canceled.") return null;
+      if (token !== runToken.current) return null; // user canceled mid-download
+      setError(
+        `${e instanceof Error ? e.message : String(e)} Analysis did not start.`,
+      );
+      setProgress(null);
+      setModal("models");
+      return null;
+    }
+  }
+  async function run() {
     if (!videoFile) {
       upload.current?.click();
-      return;
-    }
-    if (!detector || !pose) {
-      setModal("models");
       return;
     }
     if (
@@ -223,6 +368,10 @@ function App() {
     setSession(null);
     setBaseline(null);
     setProgress(0);
+    setStatus("Preparing models…");
+    const token = ++runToken.current;
+    const models = await prepareModels(token);
+    if (!models || token !== runToken.current) return;
     setStatus("Starting private analysis…");
     const w = new Worker(
       new URL("./workers/analysis.worker.ts", import.meta.url),
@@ -255,7 +404,13 @@ function App() {
       setProgress(null);
       w.terminate();
     };
-    w.postMessage({ file: videoFile, detector, pose, settings, boat });
+    w.postMessage({
+      file: videoFile,
+      detector: models.d,
+      pose: models.p,
+      settings,
+      boat,
+    });
   }
   function correct(c: Correction) {
     if (!session) return;
@@ -855,9 +1010,14 @@ function App() {
                     </span>
                     <span>
                       <strong>
-                        {pose && detector
+                        {(detector ||
+                          modelState.detector.state === "cached" ||
+                          modelState.detector.state === "ready") &&
+                        (pose ||
+                          modelState.pose.state === "cached" ||
+                          modelState.pose.state === "ready")
                           ? "Whole-body models ready"
-                          : "Configure whole-body models"}
+                          : "Models download on first analysis"}
                       </strong>
                       <small>
                         {settings.tta
@@ -894,8 +1054,11 @@ function App() {
                       <button
                         className="text-button"
                         onClick={() => {
+                          runToken.current++;
+                          downloadAbort.current?.abort();
                           worker.current?.terminate();
                           setProgress(null);
+                          setStatus("");
                           setToast(
                             "Analysis canceled. No partial metrics reported.",
                           );
@@ -1297,6 +1460,101 @@ function App() {
                     />
                   </label>
                 </div>
+                <div className="model-cache" aria-label="Automatic model cache">
+                  <div className="model-cache-head">
+                    <strong>Automatic download & cache</strong>
+                    <small>
+                      Models download once from the configured source, then load
+                      from this browser’s cache. A local file above always takes
+                      precedence.
+                    </small>
+                  </div>
+                  {(["detector", "pose"] as const).map((id) => {
+                    const spec = modelSpecs[id];
+                    const st = modelState[id];
+                    const local = id === "detector" ? detector : pose;
+                    const pct =
+                      st.total > 0
+                        ? Math.round((st.received / st.total) * 100)
+                        : 0;
+                    const label = local
+                      ? `Using local file · ${local.name}`
+                      : st.state === "cached"
+                        ? `Cached · ${mb(st.total)}`
+                        : st.state === "ready"
+                          ? `Downloaded and cached · ${mb(st.total)}`
+                          : st.state === "downloading"
+                            ? `Downloading · ${pct}% of ${mb(st.total)}`
+                            : st.state === "checking"
+                              ? "Checking cache…"
+                              : spec.url
+                                ? "Not cached · downloads on first analysis"
+                                : "No download URL in this build · import locally";
+                    return (
+                      <div className="model-cache-row" key={id}>
+                        <div>
+                          <strong>{spec.label}</strong>
+                          <small>{label}</small>
+                          {st.state === "error" && !local && (
+                            <small className="model-cache-error" role="alert">
+                              {st.error}
+                            </small>
+                          )}
+                        </div>
+                        {st.state === "downloading" && (
+                          <progress
+                            aria-label={`${spec.fileName} download progress`}
+                            value={st.received}
+                            max={st.total || 1}
+                          />
+                        )}
+                        <div className="model-cache-actions">
+                          {spec.url &&
+                            !local &&
+                            st.state !== "cached" &&
+                            st.state !== "ready" &&
+                            st.state !== "downloading" && (
+                              <button
+                                className="button small"
+                                onClick={() => {
+                                  downloadOrCache(
+                                    id,
+                                    spec,
+                                    runToken.current,
+                                    false,
+                                  ).catch(() => {});
+                                }}
+                              >
+                                <Download size={13} /> Download now
+                              </button>
+                            )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                  <button
+                    className="text-button"
+                    onClick={async () => {
+                      await clearModelCache();
+                      resolvedModels.current = {};
+                      setModelState({
+                        detector: {
+                          state: "missing",
+                          received: 0,
+                          total: modelSpecs.detector.bytes,
+                        },
+                        pose: {
+                          state: "missing",
+                          received: 0,
+                          total: modelSpecs.pose.bytes,
+                        },
+                      });
+                      setToast("Cached model files removed.");
+                    }}
+                  >
+                    Clear cached models
+                  </button>
+                </div>
                 <div className="two-fields">
                   <label>
                     Detector export
@@ -1437,9 +1695,9 @@ function App() {
                 <div className="alert">
                   <AlertTriangle size={17} />
                   <p>
-                    This environment could not retrieve the pretrained weights
-                    from their model host. Import them locally to enable
-                    inference. A working adapter is not an accuracy validation.
+                    Automatic download needs the model URLs configured for this
+                    build. If a download fails, import the files locally to
+                    continue. A working adapter is not an accuracy validation.
                   </p>
                 </div>
                 <div className="model-links">

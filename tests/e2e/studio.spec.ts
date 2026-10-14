@@ -106,3 +106,22 @@ test("layout remains usable at a narrow viewport", async ({ page }) => {
     await page.evaluate(() => document.documentElement.scrollWidth),
   ).toBeLessThanOrEqual(600);
 });
+test("model cache panel reports no-URL builds and keeps local import as fallback", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: "Models & settings" }).click();
+  const panel = page.getByLabel("Automatic model cache");
+  await expect(panel).toContainText("YOLOX-L person detector");
+  await expect(panel).toContainText("No download URL in this build");
+  await expect(panel.getByRole("button", { name: "Download now" })).toHaveCount(
+    0,
+  );
+  await expect(
+    page.getByLabel("Detector model", { exact: true }),
+  ).toBeAttached();
+  await expect(page.getByLabel("Pose model", { exact: true })).toBeAttached();
+  await page.getByRole("button", { name: "Clear cached models" }).click();
+  await expect(page.getByText("Cached model files removed.")).toBeVisible();
+  await page.getByRole("button", { name: "Close dialog" }).click();
+});

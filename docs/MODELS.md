@@ -43,9 +43,32 @@ The app imports local `.onnx` files; it does not execute Python or send video to
 ### TTA
 Two crop scales (1.25, 1.5) × original/flipped input. Preserve aspect ratio and swap all body, foot, facial, and hand mirror indices. Keep per-joint provenance and confidence. Padded crops extend beyond the image with black padding. Per-frame detection plus per-person four-pass pose inference is deliberately slow.
 
+## Automatic download and cache
+
+Weights are **never** committed to Git or bundled in the Pages build (`*.onnx` is ignored; `dist/` contains only the app). Instead, the app loads each model in this order:
+
+1. **Local file** chosen under *Models & processing* — always wins.
+2. **Cache Storage** (`row-analyzer-models-v1`) — a previous successful download, re-validated for exact size and ONNX header; a corrupt entry is evicted.
+3. **Streamed download** from the configured URL, with a live progress bar. The file must match the expected byte length (and SHA-256 when configured) before it is cached.
+4. Otherwise an actionable error and the local-file import path.
+
+Build-time configuration (repository **variables**, passed by the Pages workflow; not secrets):
+
+| Variable | Meaning |
+| --- | --- |
+| `VITE_YOLOX_URL` | HTTPS URL of `yolox_l.onnx` |
+| `VITE_DWPOSE_URL` | HTTPS URL of `dw-ll_ucoco_384.onnx` |
+| `VITE_YOLOX_BYTES`, `VITE_DWPOSE_BYTES` | Expected exact sizes. Defaults are the Drive metadata sizes (216,746,733 and 134,399,116 bytes). `0` disables the size check (test builds only). |
+
+Requirements for a download URL: HTTPS, CORS readable from the Pages origin (`Access-Control-Allow-Origin`), and the exact file bytes. Google Drive sharing links are generally **not** CORS-readable from another origin, so host the files somewhere that is, after confirming the licenses allow redistribution to your own users. Verify CORS with a browser before relying on it. With no URL set, the app shows *No download URL in this build* and the local-file import still works.
+
+Downloaded data is model weights only. Video frames and keypoints are never cached. *Clear cached models* in the dialog removes them.
+
+Each ONNX session also runs a shape-level contract check when it is created (`src/core/compat.ts`): YOLOX `[1,N,85]` or YOLOv8/11 `[1,84,N]`, square detector input, DWPose input matching the configured width/height, and 133-joint SimCC or heatmap outputs. A failed check stops analysis before any frame is decoded. Passing this check confirms the I/O contract only, not accuracy.
+
 ## Browser runtime
 
-WebGPU is attempted during model session creation, with WASM fallback if creation fails. Errors during inference are reported; the app does not silently replace the model. Model weights stay in memory for the session, not IndexedDB. WASM is single-threaded for GitHub Pages compatibility. Large/huge transformers may exceed GPU/storage-buffer/browser memory limits; compatible ONNX operators alone do not guarantee feasibility.
+WebGPU is attempted during model session creation, with WASM fallback if creation fails. Errors during inference are reported; the app does not silently replace the model. Model weights are loaded into memory for each analysis run and may be kept in Cache Storage as described above. WASM is single-threaded for GitHub Pages compatibility. Large/huge transformers may exceed GPU/storage-buffer/browser memory limits; compatible ONNX operators alone do not guarantee feasibility.
 
 ## Optional local GPU companion — proposed, not implemented
 
