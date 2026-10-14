@@ -146,7 +146,7 @@ export async function loadModel(
       `${spec.name}: download failed (HTTP ${response.status}). Use the local-file fallback.`,
     );
   const declared = Number(response.headers.get("content-length"));
-  if (declared && declared !== spec.bytes)
+  if (declared && !response.headers.get("content-encoding") && declared !== spec.bytes)
     throw Error(
       `${spec.name}: server returned an unexpected file size. Use local import.`,
     );

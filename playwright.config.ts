@@ -1,5 +1,7 @@
 import { defineConfig } from "@playwright/test";
 export default defineConfig({
+  reporter: process.env.CI ? [["list"], ["github"]] : [["list"]],
+  workers: 1,
   testDir: "./tests/e2e",
   timeout: 30000,
   use: {
