@@ -1,3 +1,13 @@
+/** Latest processed frame only; bitmap ownership stays with the UI coordinator. */
+export interface LivePreview {
+  bitmap: ImageBitmap;
+  width: number;
+  height: number;
+  time: number;
+  processed: number;
+  frames: PoseFrame[];
+}
+
 export type Origin = "observed" | "inferred" | "manual" | "missing";
 export interface Point {
   x: number;

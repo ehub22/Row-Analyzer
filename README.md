@@ -81,3 +81,15 @@ Bow seat = seat 1; the highest numbered seat is stroke seat. Sweep and sculling 
 ## Deployment policy
 
 The existing `github-pages` environment allows only `main`. The workflow therefore builds and tests the session branch, and deploys only the merged main-branch code. No environment protections are disabled or bypassed. The initial API attempt to enable Pages returned 403; subsequent inspection confirmed Pages is configured with GitHub Actions, and normal PR merge is the authorized publication path.
+
+### Live inference preview
+
+While analyzing a video, the workspace automatically shows the latest processed
+frame with the tracked skeletons, decoded timestamp, and processed-frame count.
+Preview updates are capped at five per second and the transferred image is limited
+to 960 pixels wide; every frame is still analyzed at the configured model resolution.
+The Skeleton toggle and crew/seat selector also work during processing. Playback
+and timeline navigation are disabled until processing finishes or is canceled.
+These live poses are unreviewed, before final gap recovery and stroke segmentation;
+completed results replace the preview automatically. All preview processing stays
+on-device, and preview images are released on replacement, cancellation, or error.

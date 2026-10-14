@@ -1,3 +1,4 @@
+import type { LivePreview } from "./core/types";
 import { useRef, useState, useEffect } from "react";
 import {
   Activity,
@@ -116,6 +117,7 @@ function App() {
     [modelState, setModelState] =
       useState<Record<ModelId, ModelState>>(initialModelState),
     [progress, setProgress] = useState<number | null>(null),
+    [livePreview, setLivePreview] = useState<LivePreview | null>(null),
     [status, setStatus] = useState(""),
     [joint, setJoint] = useState(9),
     [baseline, setBaseline] = useState<Session | null>(null);
@@ -127,8 +129,12 @@ function App() {
     importCompare = useRef<HTMLInputElement>(null),
     worker = useRef<Worker | null>(null),
     poseWorkers = useRef<Worker[]>([]);
+  const previewBitmap = useRef<ImageBitmap | null>(null);
   /** Terminates the coordinator and every pose-pool worker. */
   function stopWorkers() {
+    previewBitmap.current?.close();
+    previewBitmap.current = null;
+    setLivePreview(null);
     worker.current?.terminate();
     worker.current = null;
     for (const w of poseWorkers.current) w.terminate();
@@ -422,6 +428,15 @@ function App() {
     }
     w.onmessage = (e) => {
       const { type, payload } = e.data;
+      if (worker.current !== w || token !== runToken.current) {
+        if (type === "preview") payload.bitmap.close();
+        return;
+      }
+      if (type === "preview") {
+        previewBitmap.current?.close();
+        previewBitmap.current = payload.bitmap;
+        setLivePreview(payload);
+      }
       if (type === "progress") setProgress(payload);
       if (type === "status") setStatus(payload);
       if (type === "result") {
@@ -853,6 +868,8 @@ function App() {
                     </span>
                   </div>
                   <Viewer
+                    analyzing={busy}
+                    livePreview={livePreview}
                     url={url}
                     session={session}
                     time={time}
@@ -1702,15 +1719,14 @@ function App() {
                   </label>
                 </div>
                 <p className="note">
-                  Pose inference — the slow part — runs in parallel across
-                  these workers, one model session each, so it scales with
-                  your CPU cores even where WebGPU is unavailable. More
-                  workers are faster but each loads its own copy of the pose
-                  model (~134 MB for DWPose-l), so Auto leaves a core free
-                  for decoding and caps the pool at 4. Threaded WASM per
-                  worker additionally needs cross-origin isolation
-                  (COOP/COEP); the deployed site enables that with a service
-                  worker after one reload.
+                  Pose inference — the slow part — runs in parallel across these
+                  workers, one model session each, so it scales with your CPU
+                  cores even where WebGPU is unavailable. More workers are
+                  faster but each loads its own copy of the pose model (~134 MB
+                  for DWPose-l), so Auto leaves a core free for decoding and
+                  caps the pool at 4. Threaded WASM per worker additionally
+                  needs cross-origin isolation (COOP/COEP); the deployed site
+                  enables that with a service worker after one reload.
                 </p>
                 <details className="region-settings">
                   <summary>
@@ -1760,9 +1776,9 @@ function App() {
                   <span>
                     <strong>Flip + multi-scale test-time augmentation</strong>
                     <small>
-                      Four passes per crop, distributed across the pose
-                      workers. Slower processing; preserves confidence and
-                      flags disagreement.
+                      Four passes per crop, distributed across the pose workers.
+                      Slower processing; preserves confidence and flags
+                      disagreement.
                     </small>
                   </span>
                 </label>
