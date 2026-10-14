@@ -106,6 +106,24 @@ test("layout remains usable at a narrow viewport", async ({ page }) => {
     await page.evaluate(() => document.documentElement.scrollWidth),
   ).toBeLessThanOrEqual(600);
 });
+test("models dialog exposes parallel worker controls and the live plan", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: "Models & settings" }).click();
+  const workers = page.getByLabel("Parallel pose workers");
+  await expect(workers).toBeVisible();
+  await expect(workers).toHaveValue("0"); // Auto by default
+  const plan = page.getByLabel("Parallel processing plan");
+  await expect(plan).toHaveValue(/pose workers?/);
+  await expect(plan).toHaveValue(/logical cores/);
+  await workers.selectOption("2");
+  await expect(plan).toHaveValue(/2 pose workers/);
+  await expect(
+    page.getByText(/runs in parallel across these workers/),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Close dialog" }).click();
+});
 test("model cache panel reports no-URL builds and keeps local import as fallback", async ({
   page,
 }) => {

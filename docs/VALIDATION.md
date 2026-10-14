@@ -75,6 +75,16 @@ Drive metadata (checked through the user's connection, not byte-verified here):
 
 Automated checks run for this update: 46 unit tests (including the streamed download, truncated/HTML payload rejection, SHA-256 mismatch, abort, cache eviction and the I/O contract cases); the 6 production browser tests; and a browser run that auto-downloaded both test doubles, reloaded with the cache, cleared the cache, recovered from a forced download failure via local files, and completed analysis with no page errors.
 
+## Multithreading update — engineering checks (2026-10-14)
+
+Implemented a parallel WASM pose-worker pool, threaded-WASM planning, a WebGPU warm-up probe with automatic fallback, and a COOP/COEP service-worker shim for Pages. Checks run in the build sandbox (2 CPU cores, headless Chromium, **test doubles only — no real-model speed or accuracy claim**):
+
+- 60 unit tests pass, including 14 new ones: the parallelism planner (pool sizing, core-budget split, no threads without isolation + SharedArrayBuffer, explicit overrides) and the pool dispatcher (least-busy routing, out-of-order completion, tensor-buffer transfer, per-job error isolation, dead-endpoint failover, dispose semantics).
+- 8 production-build browser tests pass, including a new one for the parallel-worker settings control and live plan readout.
+- End-to-end runs through the real UI with a compute-heavy pose test double (real MatMul work, SimCC contract) on a generated 30-frame H.264 clip completed via: 1 pose worker, 2 pose workers (provider string reports `WASM pool (2 workers × 1 thread)`), TTA on (4 concurrent passes/person), and the automatic fallback path (pool deliberately broken during development → local session completed the run with a warning).
+- The sandbox browser reproduces the maintainer's WebGPU failure (`Failed to get GPU adapter`): both models now record the precise reason in session warnings and analysis completes on the WASM pool instead of relying on session-creation fallback alone.
+- **Not measured:** wall-clock speedup with real DWPose/YOLOX weights (sandbox has 2 cores and no trained models; pool-vs-single timing there is oversubscription-bound and not representative), threaded-WASM engagement under a genuinely cross-origin-isolated desktop page, Safari/Firefox worker-pool behavior, and long-clip memory with 4 × ~134 MB pose sessions. Verify on a maintainer machine via the `provider` string and per-run timing before quoting any speedup factor.
+
 ## Remaining release gates
 
 1. Retrieve licensed reference detector + whole-body weights, verify hashes/contracts and test GPU/WASM agreement on actual pixels.

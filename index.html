@@ -9,6 +9,9 @@
       content="A private, confidence-aware rowing video analysis workbench."
     />
     <title>Row Analyzer · Every stroke, understood.</title>
+    <!-- Enables cross-origin isolation (threaded WASM) on static hosts that
+         cannot set COOP/COEP headers; no-ops when already isolated. -->
+    <script src="./coi-serviceworker.js"></script>
   </head>
   <body>
     <div id="root"></div>

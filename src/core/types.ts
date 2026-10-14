@@ -88,6 +88,9 @@ export interface ModelSettings {
   height: number;
   tta: boolean;
   wasm: boolean;
+  /** Parallel pose workers. 0 = automatic (see core/parallel.ts); 1–8 = fixed.
+   * Each worker owns its own pose-model session, so more workers use more RAM. */
+  workers: number;
   region: { left: number; top: number; right: number; bottom: number };
 }
 export const defaultModels: ModelSettings = {
@@ -97,6 +100,7 @@ export const defaultModels: ModelSettings = {
   height: 384,
   tta: true,
   wasm: false,
+  workers: 0,
   region: { left: 0, top: 0, right: 100, bottom: 100 },
 };
 export const boatClasses: Record<
