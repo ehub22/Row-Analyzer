@@ -1,0 +1,76 @@
+# Row Analyzer — implementation roadmap
+
+## Product contract
+A private, offline desktop-Chrome rowing review workbench. Seat 1 is bow seat; the highest numbered seat is stroke seat. Support sweep and sculling without imposing symmetric body motion. Original footage and manual labels remain on-device; never publish private sample footage with the website. A synthetic demonstration is explicitly labeled, never substituted for an uploaded clip. Unavailable measurements read **withheld**, not zero. Confidence scores are evidence quality indicators, not calibrated probabilities.
+
+## Architecture and technology decisions
+- React + TypeScript + Vite: static, inspectable client deployable under a GitHub Pages subpath. No video-upload service, analytics, or API keys.
+- WebCodecs + MP4 demuxing: decode presentation timestamps, including variable frame rate. Feed frames with bounded backpressure into a dedicated worker. MOV works only when its container/codec is supported; report decoder failures explicitly rather than silently using imprecise seek sampling.
+- ONNX Runtime Web: request WebGPU; retry WASM when graph/operator/GPU support is absent. OffscreenCanvas performs preprocessing in the worker. Single-thread WASM works on Pages without cross-origin-isolation headers. Download/import model weights separately from code; persist only with explicit user action.
+- Top-down detector → padded, aspect-correct per-person crops → whole-body pose → seat association → offline temporal completion → stroke segmentation → confidence-gated metrics. Each is a separate testable module.
+- Separate camera calibration/boat-reference geometry from 2D pose. Pixel angles must never masquerade as camera-normalized 3D biomechanics.
+- SVG/canvas overlays and plots; JSON session/correction interchange, CSV stroke tables, PDF coaching report. Comparison uses timestamped stroke events and compatible metric provenance, not arbitrary pixel coordinates.
+
+## Model evaluation and release gate
+Candidates are evaluated by suitability, **not an invented rowing benchmark**:
+1. **ViTPose large/huge (whole-body fine-tuned head)**: strong heatmap formulation; useful for spatial uncertainty, flip/multi-scale fusion, and sub-pixel refinement. Large weights/attention activations and browser operator support are substantial risks. A standard COCO-17 checkpoint is insufficient for hands/feet. Provide a heatmap adapter for COCO-WholeBody-133 exports.
+2. **RTMW / DWPose whole-body (133 joints), high-resolution large/x variants**: practical browser-first candidate, with hands and feet. Their usual ONNX exports output SimCC distributions, **not 2D heatmaps**. Keep/decode these distributions with sub-pixel refinement and TTA; do not relabel them as heatmaps. Prefer RTMW-x where memory permits; evaluate DWPose as a baseline, not a claim of highest accuracy.
+3. **Sapiens-class**: high-resolution human foundation models merit offline GPU evaluation. Memory, export compatibility, input resolution, licensing, and checkpoint keypoint taxonomy preclude assuming universal Chrome support. Best suited to an optional local GPU batch companion.
+4. **Person detection**: large YOLO/RTMDet-style ONNX detector with NMS and high-resolution input. The app supports a documented detector contract. Models and licenses must be explicitly selected; no hidden fallback to BlazePose.
+
+Use authentic trained model files, record their names/configuration, and reject incompatible tensor shapes. Local model import keeps browser inference independent of model-host CORS and prevents bundling hundreds of MB into Git. Before claiming accuracy, annotate held-out rowing clips and compare PCK/OKS, hand/foot error, seat ID switches, catch/finish timing error, and angle error against calibrated multi-view ground truth. The first release must visibly identify this gate as unmet if weights or labeled ground truth are unavailable.
+
+## Data model
+- Session: schema version, source filename (not file contents), dimensions, duration, actual decoded timestamps, boat class, discipline, seat count, per-seat rigging, best-visible seat, processing settings, model provenance, warnings.
+- PoseFrame: presentation time in seconds; seat ID; 133 keypoints in source-image pixels; each keypoint has confidence, origin (`observed`, `inferred`, `manual`, `missing`), optional flags. Optional 3D points require an explicit coordinate-system/calibration provenance.
+- BoatCalibration: shell axis, azimuth estimate/confidence, known dimensions, camera intrinsics/extrinsics if available, observability flags. A shell axis in the image alone does not determine azimuth.
+- Stroke: seat, catch/finish/next-catch timestamps, rate in strokes per minute, drive-to-recovery ratio, evidence fraction, confidence, metrics with units/reasons for withholding.
+- Correction: seat, timestamp, joint index, old/new position, source visibility, neighborhood refit extent. COCO-style training export retains frame identity and visibility; inferred labels excluded from ground truth.
+
+## Occlusion and seat strategy
+1. Initialize seats by position along shell axis (bow direction must be verified), with best-visible seat selected. Rower detections are not automatically coxswains or seats: initial selection is reviewable.
+2. Associate globally using predicted positions and boat-axis ordering; reject implausible motion/ambiguous assignments instead of exchanging identities. Maintain empty tracks through disappearance. Nearest-neighbor association alone is insufficient for crossing eights.
+3. Preserve raw observations. Reject sudden low-confidence jumps. Fill only short, bounded gaps bidirectionally, cap inferred confidence, leave long gaps missing. Do not smooth through a flagged discontinuity.
+4. Estimate bone lengths from high-confidence observations; validate rather than force hidden limbs into a plausible fiction. Feet/hands can be constrained only if stretcher/handle landmarks or boat-motion transforms are actually observed. Sweep hands share a handle; sculling hands do not.
+5. Future learned per-seat phase template and temporal 3D completion (MotionBERT-style) require rowing adaptation. Never treat template outputs as observations. Use corrections as hard local anchors; propagated changes remain inferred.
+6. Coaching metrics dominated by inference are withheld. UI differentiates solid observed, dashed inferred, manual corrected, and missing keypoints.
+
+## Camera normalization and scale
+Automatic multi-cue camera estimation is a research milestone, not a solved consequence of 2D keypoints. Hull/rigger lines, oar shafts, hip/shoulder seat alignment and compensated optical flow can propose hypotheses. Bow/stern symmetry, unknown focal length, camera motion, and foreshortening create ambiguities. Fuse independent cues and abstain when underconstrained. A user-verified axis is a useful assist, not an automatic azimuth measurement.
+
+Known shell length, rigger spread and oar length constrain scale only with valid projections/calibration. An eight has no single exact standard length; use a manufacturer/user value (roughly 17–18 m as guidance, not ground truth). Do not derive split per 500 m from panning video. A genuine 3D lifting model and camera solution are prerequisites for normalized trunk, shin, knee, hip, elbow, shoulder, head, and oar angles. Withhold these until then. Synthetic projection tests validate the geometry implementation, not monocular depth recovery.
+
+## Milestones and acceptance tests
+1. **Foundation**: accessible workbench, roadmap, private upload, source playback, frame navigation, boat/rigging setup, clearly marked synthetic demo. Verify build and UI.
+2. **Decode/inference**: WebCodecs worker, bounded frame queue, cancellable progress, detector and whole-body ONNX adapters, GPU/WASM fallback, padded crops, flip + multi-scale TTA and sub-pixel decoding. Test tensor decoding/crop mapping and actual clip decode. Accuracy claims require real weights and labels.
+3. **Seat/occlusion**: stable seat slots, gated global assignment, missing tracks, short-gap completion, jump flags, manual correction and local propagation. Test masking and crossing/ambiguity fixtures.
+4. **Geometry**: camera confidence and abstention; tested boat-frame transforms and scale utilities. Full automatic camera solve and temporal 3D lift stay gated until validated. Test many synthetic viewpoints.
+5. **Analysis**: cycle segmentation, rate, ratio, evidence gating, crew catch/finish synchronization and phase. Single-seat sweep/scull overlays; withhold unsupported biomechanics and oar metrics. Test synthetic rates, lag, incomplete strokes and missing evidence.
+6. **Review/export**: corrections/training labels, comparison, per-stroke tables, CSV/JSON/PDF; verify exports preserve confidence and warnings. Camera-position guidance built in.
+7. **Validation/deployment**: private Drive samples kept ignored; record decode and tracking validation separately. CI typecheck/test/build; GitHub Pages Actions deployment from the session branch. Verify workflow outcome and publish URL.
+8. **Research completion**: annotated rowing benchmark, detector selection excluding coxswains, hull/handle/oar models, automatic motion-compensated calibration, rowing-trained 3D lift, cyclic/bone/handle/stretcher priors and companion GPU inference. Only then promote inferred biomechanics to validated coaching measurements.
+
+## Risks and mitigations
+- Heavy occlusion, spray, reflections, far-side hands: retain missing data; improve camera position; keyframe correction; label visibility explicitly.
+- Monocular depth ambiguity: never promise viewpoint-invariant angles without calibration; no 2D cosine “correction.”
+- Hardware/memory/operator variation: bounded queues, cancel controls, WASM fallback, local files, honest failure messages; optional local GPU companion later.
+- Whole-body output taxonomy and preprocessing vary: explicit input dimensions/format; shape checks; record provenance.
+- Unknown frame rotation/edit lists and codec support: validate real clips, reject unsupported decoding, compare presentation against native video before timing claims.
+- Model licenses and large binaries: don't redistribute unreviewed weights; document upstream sources and licenses.
+- Sample videos are not labeled ground truth: visual inspection is not proof of accuracy; publish validation status, never the private clips.
+
+## Labeling/fine-tuning workflow
+Choose representative catch/drive/finish/recovery keyframes across sweep/scull, views and occlusion severity; assign seats; correct visible joints and mark hidden joints missing. Export corrections with video/frame IDs and timestamps. Extract matching frames locally, obtain athlete consent, split by athlete/crew/session (not adjacent frames), fine-tune whole-body models with boat/rigging masks and realistic occlusions. Evaluate held-out hand/foot PCK, seat switches and timing/angle errors. Never train on propagated/inferred points as if human-labeled. Re-import compatible ONNX exports and keep a versioned model/benchmark manifest.
+
+## Implementation checkpoint (2026-10-14)
+
+Milestones 1 and most of 2/3/5/6 have working engineering implementations, with the following explicit qualifications:
+- Reference weights are external and not validated; runtime was tested using ONNX test doubles.
+- Seat association is global image-space assignment, not a completed motion-compensated boat-frame tracker.
+- Occlusion recovery is short bounded interpolation and jump gating, not learned cyclic/3D completion or a full biomechanical optimizer.
+- TTA currently fuses refined coordinates, not full aligned heatmaps.
+- Stroke events are hip-to-ankle body-motion proxies, not blade-entry/release detections.
+- Comparison is aggregate timing, not phase-normalized 3D or model-stroke matching.
+- Milestone 4 implements truthful abstention and known-3D transform utilities; automatic calibration/lifting remains unimplemented.
+- Milestone 7 has unit/browser/decode checks and deployment automation; actual tracking-accuracy validation is blocked by unavailable pretrained weights and absent labels. One early H.264 sample was not emitted by the test browser in each real clip; see the validation report.
+- Milestone 8 and the optional local GPU companion remain research work, not completed features.
