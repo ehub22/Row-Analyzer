@@ -2,7 +2,7 @@
 
 A private, offline rowing-video review workbench for desktop Chrome. **Research preview, not a completed or validated biomechanics product.**
 
-- Intended Pages URL: https://ehub22.github.io/Row-Analyzer/ (**not yet published**; Pages enablement returned HTTP 403 for the connected GitHub integration).
+- Pages URL: https://ehub22.github.io/Row-Analyzer/ (deployment status is visible in GitHub Actions).
 - [Complete roadmap](ROADMAP.md)
 - [Model contracts and setup](docs/MODELS.md)
 - [Validation results and limitations](docs/VALIDATION.md)
@@ -70,12 +70,12 @@ The synthetic demo works without model downloads and is always marked as synthet
 
 `google_drive/`, `private/`, `.cache/`, media, and model binaries are ignored. Downloaded sample videos, extracted frames, and athlete imagery are never included in the repository or Pages build. No sample Drive IDs are needed by the published app. Only `dist/` is uploaded by the Pages workflow.
 
-Pages uses GitHub Actions, not a generated `gh-pages` branch. Deployment is triggered by the working branch `arena/d1e71cca-row-analyzer`. Relative asset URLs support `/Row-Analyzer/`. Single-thread WASM does not require COOP/COEP headers, which GitHub Pages cannot configure.
+Pages uses GitHub Actions, not a generated `gh-pages` branch. Build/test runs on the working branch `arena/d1e71cca-row-analyzer`. Publication runs after the pull request is merged into `main`, honoring the existing Pages environment policy. Relative asset URLs support `/Row-Analyzer/`. Single-thread WASM does not require COOP/COEP headers, which GitHub Pages cannot configure.
 
 ## Modeling principles
 
 Bow seat = seat 1; the highest numbered seat is stroke seat. Sweep and sculling are distinct; no symmetric-body assumption is made. Confidence is an **uncalibrated evidence score**, not the probability a point is correct. A 2D shell axis is not camera azimuth. A plausible skeleton is not ground truth. Video panning is not calibrated speed, so split per 500 m is withheld.
 
-## Deployment blocker
+## Deployment policy
 
-The connected GitHub integration can push repository contents but the request to enable Pages returned `403 Resource not accessible by integration`. Enable **Settings → Pages → Build and deployment → Source: GitHub Actions**, then rerun the deployment workflow. Alternatively reconnect GitHub in Arena with the required Pages/administration permissions. No token or password needs to be pasted into chat.
+The existing `github-pages` environment allows only `main`. The workflow therefore builds and tests the session branch, and deploys only the merged main-branch code. No environment protections are disabled or bypassed. The initial API attempt to enable Pages returned 403; subsequent inspection confirmed Pages is configured with GitHub Actions, and normal PR merge is the authorized publication path.

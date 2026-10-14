@@ -1,7 +1,7 @@
 name: Test and deploy Row Analyzer
 on:
   push:
-    branches: [arena/d1e71cca-row-analyzer]
+    branches: [main, arena/d1e71cca-row-analyzer]
   workflow_dispatch:
 permissions:
   contents: read
@@ -28,6 +28,7 @@ jobs:
         with:
           path: dist
   deploy:
+    if: github.ref == 'refs/heads/main'
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

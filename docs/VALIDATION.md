@@ -70,4 +70,4 @@ Until these gates pass, normalized angles, layback, twist, sequencing faults, sc
 
 ## Publication status
 
-Code and GitHub Actions deployment configuration are prepared on the working branch. Enabling the Pages site via GitHub API returned HTTP 403 `Resource not accessible by integration`. This is a genuine permission blocker; the site is not claimed live. The owner must enable GitHub Actions as the Pages source or reconnect an integration with Pages/administration write permission, then rerun the workflow.
+Code and GitHub Actions configuration are on the working branch. GitHub CI build, all unit tests and all six browser tests passed. The initial Pages enablement request returned 403; subsequent inspection confirmed Pages is configured for Actions but its environment allows only `main`. The first session-branch deployment was rejected by that protection. The workflow now publishes only main-branch merges, without modifying environment policy. See GitHub Actions for the final deployment result.
