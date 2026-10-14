@@ -1,29 +1,63 @@
 name: Test and deploy Row Analyzer
 on:
   push:
-    branches: [main, arena/d1e71cca-row-analyzer]
+    branches: [main, arena/b47330c8-row-analyzer]
   workflow_dispatch:
 permissions:
   contents: read
   pages: write
   id-token: write
 concurrency:
-  group: pages
+  group: pages-${{ github.ref }}
   cancel-in-progress: true
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: "22"
           cache: npm
       - run: npm ci
       - run: npm test
       - run: npm run build
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Download pinned models outside Git and verify CPU compatibility
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download model-weights-v1 -D private/models -p '*.onnx'
+          pip install onnx==1.17.0 onnxruntime==1.20.1 numpy==2.2.6
+          python scripts/prepare_models.py
+          mkdir -p dist/models
+          cp private/models/*.onnx private/models/compatibility.json dist/models/
+      - name: Prepare public non-rowing reference fixture
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/prepare_reference.py
       - run: npx playwright install --with-deps chromium
       - run: npm run test:e2e
+        env:
+          REAL_MODEL_TEST: "1"
+      - name: Record reference validation summary (no private video)
+        if: always()
+        run: |
+          if [ -f test-results/reference-validation.json ]; then
+            cat test-results/reference-validation.json >> "$GITHUB_STEP_SUMMARY"
+            echo "::notice title=Reference validation::$(cat test-results/reference-validation.json)"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: validation-report
+          path: |
+            private/models/compatibility.json
+            test-results/reference-validation.json
+          if-no-files-found: ignore
       - uses: actions/upload-pages-artifact@v3
         with:
           path: dist

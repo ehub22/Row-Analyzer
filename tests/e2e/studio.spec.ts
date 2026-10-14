@@ -106,3 +106,60 @@ test("layout remains usable at a narrow viewport", async ({ page }) => {
     await page.evaluate(() => document.documentElement.scrollWidth),
   ).toBeLessThanOrEqual(600);
 });
+
+test("download failure keeps a usable local-file fallback and retry", async ({
+  page,
+}) => {
+  await page.route("**/models/yolox_l.onnx", (route) =>
+    route.fulfill({ status: 503, body: "Unavailable" }),
+  );
+  await page.goto("/");
+  await page.getByRole("button", { name: "Models & settings" }).click();
+  await page.getByRole("button", { name: "Download / restore models" }).click();
+  await expect(page.getByRole("dialog").getByRole("alert")).toContainText(
+    "local-file fallback",
+  );
+  await expect(
+    page.getByLabel("Detector model", { exact: true }),
+  ).toBeEnabled();
+  await expect(
+    page.getByRole("button", { name: "Download / restore models" }),
+  ).toBeEnabled();
+  await page
+    .getByLabel("Detector model", { exact: true })
+    .setInputFiles({
+      name: "not-model.onnx",
+      mimeType: "application/octet-stream",
+      buffer: Buffer.from("<html>not a model</html>"),
+    });
+  await expect(page.getByRole("dialog").getByRole("alert")).toContainText(
+    "not an ONNX model",
+  );
+});
+
+test("experimental 3D and biomechanics have explicit evidence labels and export", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page.getByText("Explore a synthetic demo").click();
+  await page
+    .getByRole("button", { name: "3D & biomechanics", exact: true })
+    .click();
+  await expect(page.locator(".advanced-panel")).toContainText(
+    "EXPERIMENTAL · NOT CALIBRATED",
+  );
+  await expect(
+    page.getByRole("img", { name: "Experimental 3D skeleton" }),
+  ).toBeVisible();
+  await page.getByLabel("Orbit 3D preview").fill("90");
+  await expect(page.locator(".advanced-panel")).toContainText(
+    "not camera calibration): 90°",
+  );
+  const csv = page.waitForEvent("download");
+  await page.getByRole("button", { name: "Export biomechanics CSV" }).click();
+  expect((await csv).suggestedFilename()).toBe("rowing-biomechanics-2d.csv");
+  await page.setViewportSize({ width: 600, height: 900 });
+  expect(
+    await page.evaluate(() => document.documentElement.scrollWidth),
+  ).toBeLessThanOrEqual(600);
+});

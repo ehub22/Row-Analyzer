@@ -24,6 +24,8 @@ export interface PoseFrame {
   points: Point[];
   box: Box;
   identityConfidence: number;
+  lifted?: LiftedPose;
+  oars?: OarCandidate[];
 }
 export interface Boat {
   name: string;
@@ -54,8 +56,9 @@ export interface CameraEstimate {
   azimuth: number | null;
   confidence: number;
   reason: string;
-  source: "unresolved" | "calibrated" | "synthetic";
+  source: "unresolved" | "calibrated" | "synthetic" | "estimated";
   axis: { x: number; y: number };
+  uncertaintyDegrees?: number;
 }
 export interface Correction {
   seat: number;
@@ -88,6 +91,7 @@ export interface ModelSettings {
   height: number;
   tta: boolean;
   wasm: boolean;
+  oars?: boolean;
   region: { left: number; top: number; right: number; bottom: number };
 }
 export const defaultModels: ModelSettings = {
@@ -137,3 +141,24 @@ export const missing = (): Point => ({
   confidence: 0,
   origin: "missing",
 });
+
+export interface LiftedPose {
+  method: "kinematic-weak-perspective-v1";
+  points: ((Vec3 & { confidence: number }) | null)[];
+  units: "torso lengths";
+  ambiguous: true;
+}
+export interface OarCandidate {
+  side: "left" | "right";
+  start: { x: number; y: number };
+  end: { x: number; y: number };
+  confidence: number;
+  support: number;
+  age: number;
+  source: "image-line-candidate";
+}
+export interface BiomechanicsRow {
+  seat: number;
+  stroke: number;
+  metrics: Record<string, Metric>;
+}

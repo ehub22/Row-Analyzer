@@ -1,6 +1,9 @@
+import { deriveAdvanced } from "../core/advanced";
+import { OarTracker, imageEdges } from "../core/oars";
 import * as ort from "onnxruntime-web/webgpu";
 import wasmUrl from "../../node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.jsep.wasm?url";
 import wasmModule from "../../node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.jsep.mjs?url";
+import { validateInput, validateOutputs } from "../core/modelContract";
 import { decodeVideo } from "../core/video";
 import { decodeYolo, decodeYolox, paddedCrop } from "../core/detection";
 import { decodeSimCC, decodeHeatmap, unflip, fusePoses } from "../core/pose";
@@ -26,28 +29,52 @@ interface Job {
 const send = (type: string, payload: unknown) => postMessage({ type, payload });
 ort.env.wasm.numThreads = 1;
 ort.env.wasm.wasmPaths = { wasm: wasmUrl, mjs: wasmModule };
-async function model(file: File, forceWasm: boolean) {
+async function model(
+  file: File,
+  kind: "detector" | "pose",
+  settings: ModelSettings,
+) {
   const bytes = await file.arrayBuffer();
-  if (!forceWasm)
+  let lastError: unknown;
+  for (const provider of settings.wasm ? ["wasm"] : ["webgpu", "wasm"]) {
+    let session: ort.InferenceSession | undefined;
     try {
+      session = await ort.InferenceSession.create(bytes, {
+        executionProviders: [provider],
+      });
+      const size = validateInput(session.inputMetadata, kind, settings);
+      const w = kind === "detector" ? size : settings.width,
+        h = kind === "detector" ? size : settings.height;
+      const out = await infer(
+        session,
+        new ort.Tensor("float32", new Float32Array(3 * w * h), [1, 3, h, w]),
+      );
+      try {
+        validateOutputs(
+          session.outputNames.map((n) => out[n]),
+          kind,
+          settings,
+          size,
+        );
+      } finally {
+        Object.values(out).forEach((t) => t.dispose());
+      }
       return {
-        session: await ort.InferenceSession.create(bytes, {
-          executionProviders: ["webgpu"],
-        }),
-        provider: "WebGPU",
+        session,
+        provider: provider === "wasm" ? "WASM" : "WebGPU",
+        size,
       };
     } catch (e) {
-      send(
-        "status",
-        `WebGPU unavailable for ${file.name}; retrying WASM. ${String(e).slice(0, 100)}`,
-      );
+      lastError = e;
+      await session?.release();
+      if (provider === "webgpu")
+        send(
+          "status",
+          `WebGPU creation/inference unavailable for ${file.name}; retrying WASM. ${String(e).slice(0, 120)}`,
+        );
     }
-  return {
-    session: await ort.InferenceSession.create(bytes, {
-      executionProviders: ["wasm"],
-    }),
-    provider: "WASM",
-  };
+  }
+  throw Error(`${file.name}: compatibility check failed. ${String(lastError)}`);
 }
 const canvas = new OffscreenCanvas(640, 640);
 const ctx = canvas.getContext("2d", { willReadFrequently: true })!;
@@ -69,15 +96,17 @@ function tensor(
     ctx.scale(-1, 1);
   }
   if (crop) {
-    ctx.drawImage(frame, crop.x, crop.y, crop.width, crop.height, 0, 0, w, h);
+    ctx.scale(w / crop.width, h / crop.height);
+    ctx.translate(-crop.x, -crop.y);
+    ctx.drawImage(frame, 0, 0);
   } else {
     const ratio = Math.min(w / frame.displayWidth, h / frame.displayHeight);
     ctx.drawImage(
       frame,
       0,
       0,
-      frame.displayWidth * ratio,
-      frame.displayHeight * ratio,
+      Math.floor(frame.displayWidth * ratio),
+      Math.floor(frame.displayHeight * ratio),
     );
   }
   ctx.restore();
@@ -103,17 +132,20 @@ async function infer(session: ort.InferenceSession, input: ort.Tensor) {
   }
 }
 async function run(job: Job) {
-  send("status", "Loading detector and whole-body pose model…");
-  const d = await model(job.detector, job.settings.wasm);
+  send(
+    "status",
+    "Loading detector and whole-body pose model; validating inference…",
+  );
+  const d = await model(job.detector, "detector", job.settings);
   let p: Awaited<ReturnType<typeof model>> | undefined;
   try {
-    p = await model(job.pose, job.settings.wasm);
+    p = await model(job.pose, "pose", job.settings);
     const poseSession = p.session;
-    const detectorMeta = d.session.inputMetadata[0];
-    const shape = detectorMeta.isTensor ? detectorMeta.shape : [];
-    const size = typeof shape[2] === "number" ? shape[2] : 640;
-    if (size !== shape[3] && typeof shape[3] === "number")
-      throw Error("Detector must have a square NCHW input.");
+    const size = d.size;
+    send("status", "Model input/output contracts and finite inference passed.");
+    const oarTracker = new OarTracker();
+    const edgeCanvas = new OffscreenCanvas(640, 360);
+    const edgeCtx = edgeCanvas.getContext("2d", { willReadFrequently: true })!;
     const tracker = new SeatTracker(job.boat),
       frames: PoseFrame[] = [],
       timestamps: number[] = [];
@@ -134,6 +166,12 @@ async function run(job: Job) {
         );
         let boxes: Box[];
         try {
+          validateOutputs(
+            d.session.outputNames.map((n) => out[n]),
+            "detector",
+            job.settings,
+            size,
+          );
           const raw = out[d.session.outputNames[0]];
           const ratio = Math.min(
             size / frame.displayWidth,
@@ -185,6 +223,7 @@ async function run(job: Job) {
               );
               try {
                 const vals = poseSession.outputNames.map((n) => outputs[n]);
+                validateOutputs(vals, "pose", job.settings);
                 let points: Point[];
                 if (job.settings.format === "simcc") {
                   if (
@@ -220,7 +259,24 @@ async function run(job: Job) {
             }
           detections.push({ box, points: fusePoses(poses) });
         }
-        frames.push(...tracker.update(detections, time));
+        const tracked = tracker.update(detections, time);
+        if (job.settings.oars) {
+          edgeCanvas.height = Math.round(
+            (640 * frame.displayHeight) / frame.displayWidth,
+          );
+          edgeCtx.drawImage(frame, 0, 0, 640, edgeCanvas.height);
+          oarTracker.update(
+            imageEdges(
+              edgeCtx.getImageData(0, 0, 640, edgeCanvas.height).data,
+              640,
+              edgeCanvas.height,
+            ),
+            tracked,
+            frame.displayWidth,
+            frame.displayHeight,
+          );
+        }
+        frames.push(...tracked);
         timestamps.push(time);
       },
       (v) => send("progress", v * 0.94),
@@ -251,12 +307,13 @@ async function run(job: Job) {
           : []),
         "Experimental tracking: review seat identity and keypoints before coaching.",
         "Catch/finish events are hip-to-ankle cycle proxies, not directly observed blade entry/release.",
-        "3D camera normalization, oar tracking, and depth-dependent biomechanics are not validated and are withheld.",
+        "Automatic viewpoint and kinematic 3D are assumption-based estimates, not calibrated measurements. Oar lines are experimental candidates, not observed blade events. Depth-dependent biomechanics remain withheld.",
       ],
       model: `${job.detector.name} + ${job.pose.name}; ${job.settings.width}×${job.settings.height}; ${job.settings.tta ? "flip + multi-scale TTA" : "single pass"}`,
       provider: `${d.provider} / ${p.provider}`,
     };
-    send("result", session);
+    send("status", "Estimating viewpoint and ambiguous kinematic 3D…");
+    send("result", deriveAdvanced(session));
   } finally {
     await d.session.release();
     if (p) await p.session.release();

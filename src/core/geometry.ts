@@ -58,7 +58,7 @@ export function metricVisibility(camera: CameraEstimate): {
       camera.source === "calibrated" &&
       camera.confidence >= 0.8 &&
       camera.azimuth !== null &&
-      camera.azimuth < 60,
+      Math.abs(camera.azimuth) < 60,
     reason:
       "Needs validated 3D pose and camera calibration. Film alongside, near perpendicular to the shell, with the whole rower visible.",
   };

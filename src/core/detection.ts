@@ -17,14 +17,22 @@ export function nms(boxes: Box[], threshold = 0.45): Box[] {
   }
   return result;
 }
-// YOLOX decoded-grid export, [1,8400,85], raw BGR 0..255 input, top-left letterbox.
+// YOLOX raw-grid export, [1,8400,85], raw BGR 0..255 input, top-left letterbox.
 export function decodeYolox(
   data: Float32Array,
   dims: readonly number[],
   size: number,
   ratio: number,
 ): Box[] {
-  if (dims.length !== 3 || dims[2] !== 85)
+  if (
+    dims.length !== 3 ||
+    dims[0] !== 1 ||
+    dims[2] !== 85 ||
+    dims[1] !== [8, 16, 32].reduce((n, s) => n + (size / s) ** 2, 0) ||
+    data.length !== dims[1] * 85 ||
+    !Number.isFinite(ratio) ||
+    ratio <= 0
+  )
     throw Error(
       "Expected YOLOX output [1,N,85]. Use yolox_l.onnx with raw grid outputs.",
     );
@@ -35,11 +43,13 @@ export function decodeYolox(
       for (let x = 0; x < size / stride; x++) {
         const k = row++ * 85,
           score = data[k + 4] * data[k + 5];
-        if (score < 0.35) continue;
+        if (!Number.isFinite(score) || score < 0.35) continue;
         const cx = ((data[k] + x) * stride) / ratio,
           cy = ((data[k + 1] + y) * stride) / ratio,
           w = (Math.exp(data[k + 2]) * stride) / ratio,
           h = (Math.exp(data[k + 3]) * stride) / ratio;
+        if (![cx, cy, w, h].every(Number.isFinite) || w <= 0 || h <= 0)
+          continue;
         boxes.push({
           x: cx - w / 2,
           y: cy - h / 2,
@@ -64,7 +74,7 @@ export function decodeYolo(
     boxes: Box[] = [];
   for (let i = 0; i < n; i++) {
     const score = data[4 * n + i];
-    if (score < 0.35) continue;
+    if (!Number.isFinite(score) || score < 0.35) continue;
     boxes.push({
       x: (data[i] - data[2 * n + i] / 2) / ratio,
       y: (data[n + i] - data[3 * n + i] / 2) / ratio,

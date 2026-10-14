@@ -181,6 +181,19 @@ export default function Viewer(p: Props) {
         ctx.fill();
       }
       if (!overlay) continue;
+      for (const oar of f.oars || []) {
+        ctx.strokeStyle = "#e4b05c";
+        ctx.lineWidth = width / 450;
+        ctx.setLineDash([10, 8]);
+        ctx.beginPath();
+        ctx.moveTo(oar.start.x, oar.start.y);
+        ctx.lineTo(oar.end.x, oar.end.y);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = "#e4b05c";
+        ctx.font = `${width / 100}px sans-serif`;
+        ctx.fillText("oar candidate", oar.end.x, oar.end.y - 8);
+      }
       ctx.lineWidth = width / 600;
       for (const [a, b] of bones) {
         const start = f.points[a],

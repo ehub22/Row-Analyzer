@@ -1,3 +1,7 @@
+import AdvancedPanel from "./components/AdvancedPanel";
+import { deriveAdvanced } from "./core/advanced";
+import { useModels } from "./hooks/useModels";
+import ModelDownloads from "./components/ModelDownloads";
 import { useRef, useState, useEffect } from "react";
 import {
   Activity,
@@ -48,7 +52,13 @@ import {
   validateSession,
 } from "./core/export";
 import { jointNames } from "./core/keypoints";
-const tabs = ["Overview", "Crew timing", "Compare", "Keyframe labels"];
+const tabs = [
+  "Overview",
+  "Crew timing",
+  "Compare",
+  "Keyframe labels",
+  "3D & biomechanics",
+];
 const metricNames = [
   "Catch shin angle",
   "Catch body angle",
@@ -85,8 +95,6 @@ function App() {
     [error, setError] = useState(""),
     [exportOpen, setExportOpen] = useState(false),
     [settings, setSettings] = useState<ModelSettings>(defaultModels),
-    [detector, setDetector] = useState<File | null>(null),
-    [pose, setPose] = useState<File | null>(null),
     [progress, setProgress] = useState<number | null>(null),
     [status, setStatus] = useState(""),
     [joint, setJoint] = useState(9),
@@ -95,7 +103,9 @@ function App() {
     importSession = useRef<HTMLInputElement>(null),
     importCompare = useRef<HTMLInputElement>(null),
     worker = useRef<Worker | null>(null);
-  const busy = progress !== null;
+  const models = useModels();
+  const { detector, pose } = models;
+  const busy = progress !== null || models.loading;
   const currentBoat = session?.boat || boat;
   const rows = session?.strokes.filter((s) => crew || s.seat === seat) || [];
   const rate = mean(rows.map((s) => s.rate.value)),
@@ -158,6 +168,7 @@ function App() {
       return;
     }
     worker.current?.terminate();
+    models.cancel();
     setProgress(null);
     setVideoFile(file);
     setUrl(URL.createObjectURL(file));
@@ -178,8 +189,9 @@ function App() {
   }
   function demo() {
     worker.current?.terminate();
+    models.cancel();
     setProgress(null);
-    const s = createDemo(boat);
+    const s = deriveAdvanced(createDemo(boat));
     setSession(s);
     setBaseline(structuredClone(s));
     setSeat(boat.seats);
@@ -203,12 +215,17 @@ function App() {
     });
     setSeat(def.seats);
   }
-  function run() {
+  async function run() {
+    if (busy) return;
     if (!videoFile) {
       upload.current?.click();
       return;
     }
-    if (!detector || !pose) {
+    let ready: { detector: File; pose: File };
+    try {
+      ready = await models.ensure();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
       setModal("models");
       return;
     }
@@ -255,17 +272,23 @@ function App() {
       setProgress(null);
       w.terminate();
     };
-    w.postMessage({ file: videoFile, detector, pose, settings, boat });
+    w.postMessage({ file: videoFile, ...ready, settings, boat });
   }
   function correct(c: Correction) {
     if (!session) return;
     const frames = applyCorrection(session.frames, c);
-    setSession({
-      ...session,
-      frames,
-      strokes: segmentStrokes(frames),
-      corrections: [...session.corrections, c],
+    // Wrist-dependent line tracks cannot survive a pose refit without rerunning image analysis.
+    frames.forEach((f) => {
+      if (f.seat === c.seat) delete f.oars;
     });
+    setSession(
+      deriveAdvanced({
+        ...session,
+        frames,
+        strokes: segmentStrokes(frames),
+        corrections: [...session.corrections, c],
+      }),
+    );
     setToast(
       `${jointNames[c.joint]} corrected for seat ${c.seat}. Nearby refits are labeled inferred.`,
     );
@@ -856,7 +879,7 @@ function App() {
                     <span>
                       <strong>
                         {pose && detector
-                          ? "Whole-body models ready"
+                          ? "Whole-body weights ready"
                           : "Configure whole-body models"}
                       </strong>
                       <small>
@@ -874,7 +897,10 @@ function App() {
                       <span>
                         {session?.camera.source === "synthetic"
                           ? "0° · demo"
-                          : "Unresolved"}
+                          : session?.camera.azimuth !== null &&
+                              session?.camera.azimuth !== undefined
+                            ? `${session.camera.azimuth.toFixed(0)}° · estimated`
+                            : "Unresolved"}
                       </span>
                     </div>
                     <p>
@@ -883,7 +909,9 @@ function App() {
                         : `Confidence ${Math.round((session?.camera.confidence || 0) * 100)}%. 3D angles stay withheld until validated calibration is available.`}
                     </p>
                   </div>
-                  {busy ? (
+                  {models.loading ? (
+                    <ModelDownloads models={models} />
+                  ) : progress !== null ? (
                     <div className="progress-block">
                       <div>
                         <strong>Analyzing every frame</strong>
@@ -917,7 +945,9 @@ function App() {
                   </p>
                 </aside>
               </div>
-              {tab === "Keyframe labels" ? (
+              {tab === "3D & biomechanics" ? (
+                <AdvancedPanel session={session} seat={seat} time={time} />
+              ) : tab === "Keyframe labels" ? (
                 <section className="labels-panel">
                   <div className="section-title">
                     <div>
@@ -1265,10 +1295,11 @@ function App() {
                 <div className="eyebrow">ACCURACY IS A PROCESS</div>
                 <h2>Models & processing</h2>
                 <p>
-                  Load authentic ONNX models from your device. No lightweight
-                  pose model is silently substituted. Model weights are not
-                  bundled with this research preview.
+                  Model weights are not bundled in Git. Download the verified
+                  reference pair automatically or import authentic ONNX files
+                  below. No lightweight model is silently substituted.
                 </p>
+                <ModelDownloads models={models} />
                 <div className="model-load">
                   <label>
                     <Cpu size={18} />
@@ -1280,7 +1311,10 @@ function App() {
                       aria-label="Detector model"
                       type="file"
                       accept=".onnx"
-                      onChange={(e) => setDetector(e.target.files?.[0] || null)}
+                      disabled={models.loading}
+                      onChange={(e) =>
+                        void models.local("detector", e.target.files?.[0])
+                      }
                     />
                   </label>
                   <label>
@@ -1293,7 +1327,10 @@ function App() {
                       aria-label="Pose model"
                       type="file"
                       accept=".onnx"
-                      onChange={(e) => setPose(e.target.files?.[0] || null)}
+                      disabled={models.loading}
+                      onChange={(e) =>
+                        void models.local("pose", e.target.files?.[0])
+                      }
                     />
                   </label>
                 </div>
@@ -1366,6 +1403,17 @@ function App() {
                     />
                   </label>
                 </div>
+                <label className="experimental-toggle">
+                  <input
+                    type="checkbox"
+                    checked={!!settings.oars}
+                    onChange={(e) =>
+                      setSettings({ ...settings, oars: e.target.checked })
+                    }
+                  />
+                  Track experimental oar-line candidates (on-water only, not erg
+                  footage)
+                </label>
                 <details className="region-settings">
                   <summary>
                     Detection region · exclude the coxswain / bystanders
@@ -1528,10 +1576,12 @@ function App() {
                     <strong>
                       Research preview, not validated biomechanics.
                     </strong>{" "}
-                    Automatic camera azimuth, 3D lifting, oar tracking, and
-                    sequencing diagnoses are not implemented. Unreliable metrics
-                    are withheld. Whole-body inference requires separately
-                    loaded model files.
+                    Automatic viewpoint estimation, ambiguous kinematic 3D,
+                    oar-line candidates and 2D biomechanics are experimental.
+                    True calibration, depth-dependent technique diagnoses and
+                    blade events remain withheld. Reference models download
+                    automatically on first analysis and stay cached when browser
+                    storage permits.
                   </p>
                 </div>
                 <p className="note">

@@ -1,3 +1,5 @@
+import { deriveAdvanced } from "./advanced";
+import { biomechanics } from "./biomechanics";
 import { jsPDF } from "jspdf";
 import type { Session } from "./types";
 import { mean, crewTiming, segmentStrokes } from "./strokes";
@@ -130,6 +132,18 @@ export function exportPDF(s: Session) {
       `Seat ${r.seat} / stroke ${r.index}: catch ${r.catch.toFixed(3)} s, finish proxy ${r.finish.toFixed(3)} s, rate ${r.rate.value?.toFixed(1) ?? "withheld"} spm, D:R ${r.ratio.value?.toFixed(2) ?? "withheld"}, confidence ${Math.round(r.confidence * 100)}%.`,
       9,
     );
+  text("Experimental image-plane biomechanics", 16);
+  text(
+    "2D values are not viewpoint-normalized. Kinematic depth is ambiguous, in torso-length units, not calibrated 3D. Wrist motion is a handle proxy; oar lines are candidates only.",
+  );
+  for (const row of biomechanics(s)) {
+    text(`Seat ${row.seat} / stroke ${row.stroke}`, 12);
+    for (const [name, m] of Object.entries(row.metrics))
+      text(
+        `${name}: ${m.value?.toFixed(1) ?? "withheld"} ${m.value === null ? "" : m.unit}. ${m.reason}`,
+        9,
+      );
+  }
   text("Withheld measurements", 16);
   text(
     "Normalized shin/body/joint angles, layback, trunk twist, sequencing faults, oar angles, release quality, handle crossover/height, boat set and split per 500 m require additional validated evidence.",
@@ -178,7 +192,9 @@ export function validateSession(value: unknown): Session {
       (t) => !Number.isFinite(t) || t < 0 || t > s.duration + 0.1,
     ) ||
     s.warnings.some((w) => typeof w !== "string") ||
-    !["unresolved", "calibrated", "synthetic"].includes(s.camera.source) ||
+    !["unresolved", "calibrated", "synthetic", "estimated"].includes(
+      s.camera.source,
+    ) ||
     !Number.isFinite(s.camera.confidence) ||
     s.camera.confidence < 0 ||
     s.camera.confidence > 1 ||
@@ -235,5 +251,71 @@ export function validateSession(value: unknown): Session {
     throw Error(
       "A recorded session cannot claim synthetic camera calibration.",
     );
-  return s;
+  // Derived depth/camera claims from a file are never trusted. Recompute from validated 2D evidence.
+  s.frames.forEach((f) => {
+    delete f.lifted;
+    if (
+      f.oars &&
+      (!Array.isArray(f.oars) ||
+        f.oars.length > 2 ||
+        f.oars.some(
+          (o) =>
+            !o ||
+            !["left", "right"].includes(o.side) ||
+            o.source !== "image-line-candidate" ||
+            !o.start ||
+            !o.end ||
+            ![
+              o.start.x,
+              o.start.y,
+              o.end.x,
+              o.end.y,
+              o.confidence,
+              o.support,
+              o.age,
+            ].every(Number.isFinite) ||
+            o.confidence < 0 ||
+            o.confidence > 0.6 ||
+            o.support < 0 ||
+            o.support > 1 ||
+            !Number.isInteger(o.age) ||
+            o.age < 1,
+        ))
+    )
+      throw Error("Invalid oar candidate data in session.");
+  });
+  return deriveAdvanced(s);
+}
+
+export function exportBiomechanicsCSV(s: Session) {
+  const quote = (v: unknown) => `"${String(v ?? "").replaceAll('"', '""')}"`;
+  const rows = [
+    [
+      "seat",
+      "stroke",
+      "measure",
+      "value",
+      "unit",
+      "evidence_score",
+      "limitation",
+      "demo",
+    ],
+    ...biomechanics(s).flatMap((row) =>
+      Object.entries(row.metrics).map(([name, m]) => [
+        row.seat,
+        row.stroke,
+        name,
+        m.value,
+        m.unit,
+        m.confidence,
+        m.reason,
+        s.demo,
+      ]),
+    ),
+  ];
+  download(
+    rows.map((row) => row.map(quote).join(",")).join("\n"),
+    "rowing-biomechanics-2d.csv",
+    "text/csv",
+  );
 }
