@@ -84,7 +84,7 @@ WebGPU failed on every browser/device combination the maintainer tried, and the 
 - **WebGPU warm-up probe**: WebGPU sessions must complete a zero-tensor inference before decoding starts, so "creates but cannot run" (unsupported ops, buffer limits, blocklists) falls back to the WASM pool with the reason in the session warnings.
 - **Cross-origin isolation on static hosting**: Vite sends COOP/COEP for dev/preview; `public/coi-serviceworker.js` adds the same headers on GitHub Pages after one reload, unlocking threaded WASM where the browser supports it. Without isolation the pool alone provides the speedup.
 
-Not changed: decode order, seat tracking, TTA fusion, metrics, and all accuracy gates. Speed on real weights still needs measuring on a maintainer machine (the build sandbox has 2 cores and only test-double models); per-session settings are recorded in each session's `provider` string for that comparison.
+Not changed: decode order, seat tracking, TTA fusion, metrics, and all accuracy gates. Speed on real weights still needs measuring on a maintainer machine (the build sandbox has 2 cores and only test-double models); per-session settings are recorded in each session's `provider` string for that comparison, and each run now carries its own stage timings (see the speed update below).
 
 ## GPU fix update (2026-10-14)
 
@@ -107,3 +107,73 @@ Verified in the build sandbox with `scripts/gpu-analysis-check.mjs` against the 
 | Force WASM | WASM pool; note records that WebGPU was skipped on request |
 
 Still not validated here: real pretrained weights, real hardware GPUs (the sandbox only has a software adapter), Safari/Firefox, and the mid-run device-loss path (implemented and type-checked, not triggered by a real device loss). See the validation report.
+
+## Pose-stage speed update (2026-10-14)
+
+The pool made pose inference parallel, but profiling the CPU side of the pipeline
+in the same sandbox found the *coordinator* was the bottleneck: every crop was
+drawn from the decoded `VideoFrame` and normalised on the analysis worker's
+thread, once per person × TTA pass, while every pooled worker waited for work.
+
+Measured in the build sandbox (Chromium 153, SwiftShader, 2 vCPU, constant ONNX
+test doubles and a generated 640×360 H.264 clip; `scripts/pose-perf-check.mjs`):
+
+| Step | Per call |
+| --- | --- |
+| `VideoFrame` crop → 288×384 tensor (previous path, per pass) | ~23 ms |
+| frame `ImageBitmap` crop → same tensor (per pass) | ~7 ms |
+| letterboxed 640×640 detector tensor | ~8.6 ms |
+| SimCC decode, 133 joints × both axes | ~0.27 ms |
+| `fusePoses` (4 passes) | ~0.06 ms |
+| `SeatTracker.update` (8 seats) | ~0.68 ms |
+
+Implemented since:
+
+- **`src/core/preprocess.ts`**: one `ImageBitmap` per frame; every crop, TTA pass
+  and preview draws from it, with a reused canvas and tensor buffer. The
+  rasterisation is asserted **bit-identical** to the previous per-pass
+  `VideoFrame` path (`scripts/pose-perf-check.mjs`; crop, flipped crop and the
+  letterboxed detector draw) — it changes speed only, never the model input.
+  Writing that check caught a real bug during development: the letterbox plan
+  initially cropped the source instead of scaling it.
+- **Rasterisation inside the pose workers** (`src/workers/pose.worker.ts`,
+  `src/core/pool.ts`): the coordinator posts the frame's shared bitmap plus a
+  crop box; each worker draws, normalises into its own reused buffer, runs, and
+  reports its `preprocess`/`infer`/`decode` milliseconds for the session report.
+  Jobs are queued per worker so one session and one buffer are never overlapped.
+  Where a browser cannot provide a bitmap, the coordinator rasterises and ships
+  tensors exactly as before, and says so in the notes.
+- **Adaptive test-time augmentation** (`src/core/tta.ts`, settings default): the
+  single pass runs first and the remaining three are dispatched only when a body
+  joint (COCO-17 subset of the 133-joint layout) came back below 0.3 or the body
+  mean is below 0.5. A rejected crop fuses the identical four passes as
+  *Always*; on the test-double clip 2880 of 3840 passes were skipped.
+- **Detector/pose overlap** (`src/core/queue.ts`): a bounded, in-order stage
+  pipeline keeps one frame's pose work in flight while the next frame is
+  detected. It is only used when a pose pool exists — a WebGPU or local-WASM run
+  shares one session on one thread and processes each frame in place.
+- **Self-measuring runs** (`src/core/perf.ts`): per-stage timings and pass counts
+  go into the workspace notes and into the exported session as `performance`, so
+  the next optimisation is chosen from evidence on the user's own machine.
+- **Fixtures for the checks** (`scripts/make_test_models.py --people N`,
+  `scripts/make_test_clip.py`): N-person detector doubles and a synthetic H.264
+  clip, so the pool path can be exercised end to end without weights. Never
+  validated as tracking: these are constant test doubles.
+
+End-to-end on that fixture (40 frames, eight seats, two pose workers, all three
+TTA policies against the pre-change build on the same machine): 4-pass runs
+20.9 s → 10.5–12.2 s; the new default (adaptive) 7.8–8.6 s. Runs dominated by the
+detector barely move, which the report now makes visible instead of guessable.
+
+Still open, in rough order of expected value on CPU-only machines:
+
+- **Detector cadence.** The detector runs once per frame at 640×640 and is
+  frequently the largest stage in the report. Detecting every Nth frame and
+  posing from tracked boxes needs identity confidence to be redefined for
+  predicted boxes, so it is a design change, not a setting.
+- **Real-weight measurements.** Every number above is CPU-side pipeline cost with
+  constant test doubles; relative weight of inference still needs a maintainer
+  machine with real DWPose/RTMW weights, which the build sandbox cannot fetch.
+- **Batched pose.** Stacking the 4 TTA passes of a crop into one inference needs
+  a dynamic-batch export; the contract check already ignores the batch
+  dimension, so the model side is ready but no export has been validated.

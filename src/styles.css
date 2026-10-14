@@ -2233,3 +2233,16 @@ tbody tr:hover {
   justify-self: start;
   font-size: 10px;
 }
+
+/* Run performance summary inside the analysis notes. */
+.performance-line {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 0 0 10px;
+  padding: 8px 10px;
+  border: 1px solid rgba(214, 131, 73, 0.35);
+  border-radius: 8px;
+  background: rgba(214, 131, 73, 0.08);
+  font-variant-numeric: tabular-nums;
+}
