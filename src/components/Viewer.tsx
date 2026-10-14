@@ -10,7 +10,12 @@ import {
   Upload,
   ArrowUpRight,
 } from "lucide-react";
-import type { Session, Correction, PoseFrame } from "../core/types";
+import type {
+  Session,
+  Correction,
+  PoseFrame,
+  LivePreview,
+} from "../core/types";
 import { colors } from "../core/types";
 import { bones, jointNames } from "../core/keypoints";
 export const clock = (s: number) =>
@@ -22,6 +27,8 @@ export const clock = (s: number) =>
     .toString()
     .padStart(2, "0")}`;
 interface Props {
+  analyzing?: boolean;
+  livePreview?: LivePreview | null;
   url: string;
   session: Session | null;
   time: number;
@@ -64,12 +71,15 @@ export default function Viewer(p: Props) {
     } | null>(null);
   const [sourceSize, setSourceSize] = useState({ width: 1920, height: 1080 });
   const demo = p.session?.demo;
-  const width = p.session?.width || sourceSize.width,
-    height = p.session?.height || sourceSize.height;
+  const width = p.livePreview?.width || p.session?.width || sourceSize.width,
+    height = p.livePreview?.height || p.session?.height || sourceSize.height;
   const duration = p.session?.duration || p.duration || 1;
   useEffect(() => {
     setPlaying(false);
   }, [p.url, p.session?.name]);
+  useEffect(() => {
+    if (p.analyzing) setPlaying(false);
+  }, [p.analyzing]);
   useEffect(() => {
     if (video.current && !demo) {
       video.current.playbackRate = speed;
@@ -144,10 +154,11 @@ export default function Viewer(p: Props) {
       ctx.lineWidth = 3;
       ctx.stroke();
     }
-    if (!p.session) return;
-    const frames = framesAt(p.session, p.time).filter(
-      (f) => p.crew || f.seat === p.seat,
-    );
+    if (p.livePreview) ctx.drawImage(p.livePreview.bitmap, 0, 0, width, height);
+    if (!p.session && !p.livePreview) return;
+    const frames = (
+      p.livePreview?.frames ?? framesAt(p.session!, p.time)
+    ).filter((f) => p.crew || f.seat === p.seat);
     for (const f of frames) {
       const color = colors[(f.seat - 1) % 8];
       if (demo) {
@@ -222,7 +233,7 @@ export default function Viewer(p: Props) {
         ctx.stroke();
       });
       ctx.font = `600 ${width / 90}px sans-serif`;
-      const label = `${f.seat}${f.seat === p.session.boat.seats ? " · STROKE" : f.seat === 1 ? " · BOW" : ""}`;
+      const label = `${f.seat}${f.seat === p.session?.boat.seats ? " · STROKE" : f.seat === 1 ? " · BOW" : ""}`;
       ctx.fillStyle = "#173b37";
       const bx = f.box.x + f.box.width / 2,
         by = f.box.y - 16;
@@ -232,6 +243,7 @@ export default function Viewer(p: Props) {
     }
   }, [
     p.session,
+    p.livePreview,
     p.time,
     p.seat,
     p.crew,
@@ -261,7 +273,7 @@ export default function Viewer(p: Props) {
     };
   }
   function start(e: React.PointerEvent<HTMLCanvasElement>) {
-    if (!p.editing || !p.session) return;
+    if (p.analyzing || !p.editing || !p.session) return;
     setPlaying(false);
     const frame = framesAt(p.session, p.time).find((f) => f.seat === p.seat);
     if (!frame) return;
@@ -296,13 +308,15 @@ export default function Viewer(p: Props) {
       <div className="viewer-top">
         <span>
           <span className="live-dot" />{" "}
-          {p.session
-            ? demo
-              ? "Synthetic crew study"
-              : "Source video"
-            : p.url
-              ? "Source video"
-              : "Video workspace"}
+          {p.analyzing
+            ? "Live inference preview"
+            : p.session
+              ? demo
+                ? "Synthetic crew study"
+                : "Source video"
+              : p.url
+                ? "Source video"
+                : "Video workspace"}
         </span>
         <span className="viewer-source">
           {demo
@@ -427,6 +441,16 @@ export default function Viewer(p: Props) {
             </div>
           </div>
         )}
+        {p.analyzing && (
+          <div className="stage-badges" role="status">
+            <span>
+              {p.livePreview
+                ? `${p.livePreview.processed} FRAMES · ${clock(p.livePreview.time)}`
+                : "WAITING FOR FIRST DETECTION"}
+            </span>
+            <span>LIVE · UNREVIEWED POSES</span>
+          </div>
+        )}
         {p.session && (
           <div className="stage-badges">
             <span>{p.crew ? "FULL CREW" : `SEAT ${p.seat}`}</span>
@@ -451,8 +475,8 @@ export default function Viewer(p: Props) {
           min="0"
           max={duration}
           step="0.001"
-          value={Math.min(p.time, duration)}
-          disabled={!p.session && !p.url}
+          value={Math.min(p.livePreview?.time ?? p.time, duration)}
+          disabled={p.analyzing || (!p.session && !p.url)}
           onChange={(e) => {
             setPlaying(false);
             p.setTime(+e.target.value);
@@ -470,7 +494,7 @@ export default function Viewer(p: Props) {
             title="Previous frame"
             aria-label="Previous frame"
             onClick={() => step(-1)}
-            disabled={!p.url && !p.session}
+            disabled={p.analyzing || (!p.url && !p.session)}
           >
             <SkipBack size={16} />
           </button>
@@ -478,7 +502,7 @@ export default function Viewer(p: Props) {
             className="play-button"
             title="Play or pause"
             aria-label="Play or pause"
-            disabled={!p.url && !p.session}
+            disabled={p.analyzing || (!p.url && !p.session)}
             onClick={() => setPlaying(!playing)}
           >
             {playing ? <Pause size={16} /> : <Play size={16} />}
@@ -487,12 +511,12 @@ export default function Viewer(p: Props) {
             title="Next frame"
             aria-label="Next frame"
             onClick={() => step(1)}
-            disabled={!p.url && !p.session}
+            disabled={p.analyzing || (!p.url && !p.session)}
           >
             <SkipForward size={16} />
           </button>
           <span className="timecode">
-            {clock(p.time)}{" "}
+            {clock(p.livePreview?.time ?? p.time)}{" "}
             <em>
               / {clock(duration === 1 && !p.session && !p.url ? 0 : duration)}
             </em>

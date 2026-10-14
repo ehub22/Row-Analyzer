@@ -122,8 +122,7 @@ function probeDimsFrom(
   fallback: number[],
 ): number[] {
   const meta = session.inputMetadata[0] as
-    | { shape?: readonly (number | string)[] }
-    | undefined;
+    { shape?: readonly (number | string)[] } | undefined;
   const shape = meta?.shape ?? [];
   return fallback.map((f, i) =>
     typeof shape[i] === "number" && (shape[i] as number) > 0
@@ -173,12 +172,16 @@ function tensor(
   // crop/TTA pass (up to 32× per frame), so per-pixel branching added up.
   if (mode === "pose") {
     for (let c = 0; c < 3; c++) {
-      const off = c * plane, mean = POSE_MEAN[c], inv = 1 / POSE_STD[c];
-      for (let i = 0; i < plane; i++) data[off + i] = (pixels[i * 4 + c] - mean) * inv;
+      const off = c * plane,
+        mean = POSE_MEAN[c],
+        inv = 1 / POSE_STD[c];
+      for (let i = 0; i < plane; i++)
+        data[off + i] = (pixels[i * 4 + c] - mean) * inv;
     }
   } else if (mode === "yolox") {
     for (let c = 0; c < 3; c++) {
-      const off = c * plane, src = 2 - c; // BGR
+      const off = c * plane,
+        src = 2 - c; // BGR
       for (let i = 0; i < plane; i++) data[off + i] = pixels[i * 4 + src];
     }
   } else {
@@ -240,8 +243,7 @@ function decodePoseOutputs(
 
 async function run(job: Job) {
   const plan: ParallelPlan =
-    job.parallel ??
-    planParallelism(readParallelEnv(), job.settings.workers);
+    job.parallel ?? planParallelism(readParallelEnv(), job.settings.workers);
   const notes: string[] = [];
   send("status", "Loading detector and whole-body pose model…");
   send("status", `Parallel plan: ${summarizePlan(plan)}.`);
@@ -331,7 +333,8 @@ async function run(job: Job) {
       // Wire inbound port events into the pool's dispatcher.
       poolPorts.forEach((port, i) => {
         port.onmessage = (e: MessageEvent) => pool?.handleMessage(i, e.data);
-        port.onmessageerror = () => pool?.handleError(i, new Error("Pose worker port error."));
+        port.onmessageerror = () =>
+          pool?.handleError(i, new Error("Pose worker port error."));
       });
       pool.init({
         // The File is a blob reference: each worker reads its own copy,
@@ -350,7 +353,8 @@ async function run(job: Job) {
           pool.ready(),
           new Promise<never>((_, reject) =>
             setTimeout(
-              () => reject(new Error("pose workers did not start within 120 s")),
+              () =>
+                reject(new Error("pose workers did not start within 120 s")),
               120_000,
             ),
           ),
@@ -429,7 +433,8 @@ async function run(job: Job) {
     // attempt disposed it, hence the factory argument.
     let detectorSession = d.session;
     let detectorProvider = d.provider;
-    let detectorLabel = d.provider === "WebGPU" ? (d.gpuLabel ?? "WebGPU") : d.provider;
+    let detectorLabel =
+      d.provider === "WebGPU" ? (d.gpuLabel ?? "WebGPU") : d.provider;
     const runDetector = async (makeInput: () => ort.Tensor) => {
       try {
         return await infer(detectorSession, makeInput());
@@ -530,7 +535,10 @@ async function run(job: Job) {
             notes.push(
               `A pose worker failed mid-analysis (${errText(e)}); finishing on the local WASM session. Speed is reduced for the rest of this run.`,
             );
-            send("status", "Pose worker failed; continuing on the local session.");
+            send(
+              "status",
+              "Pose worker failed; continuing on the local session.",
+            );
           }
           await ensureLocalPose();
         }
@@ -540,7 +548,14 @@ async function run(job: Job) {
       try {
         outputs = await infer(
           model.session,
-          tensor(frame, job.settings.width, job.settings.height, crop, flip, "pose"),
+          tensor(
+            frame,
+            job.settings.width,
+            job.settings.height,
+            crop,
+            flip,
+            "pose",
+          ),
         );
       } catch (e) {
         // A GPU session lost mid-run must not abort the analysis: rebuild it
@@ -550,7 +565,14 @@ async function run(job: Job) {
         model = await fallbackToWasmPose(model);
         outputs = await infer(
           model.session,
-          tensor(frame, job.settings.width, job.settings.height, crop, flip, "pose"),
+          tensor(
+            frame,
+            job.settings.width,
+            job.settings.height,
+            crop,
+            flip,
+            "pose",
+          ),
         );
       }
       try {
@@ -573,6 +595,7 @@ async function run(job: Job) {
       "status",
       `Decoding every frame · detecting people · estimating 133 joints · pose via ${poseProvider}`,
     );
+    let lastPreview = -Infinity;
     const meta = await decodeVideo(
       job.file,
       async (frame, time) => {
@@ -623,14 +646,24 @@ async function run(job: Job) {
           for (const scale of scales)
             for (const flip of flips)
               passes.push({
-                crop: paddedCrop(box, job.settings.width, job.settings.height, scale),
+                crop: paddedCrop(
+                  box,
+                  job.settings.width,
+                  job.settings.height,
+                  scale,
+                ),
                 flip,
               });
           const poses =
             pool && poolAlive
-              ? await Promise.all(passes.map((p) => posePass(frame, p.crop, p.flip)))
+              ? await Promise.all(
+                  passes.map((p) => posePass(frame, p.crop, p.flip)),
+                )
               : await passes.reduce<Promise<Point[][]>>(
-                  async (acc, p) => [...(await acc), await posePass(frame, p.crop, p.flip)],
+                  async (acc, p) => [
+                    ...(await acc),
+                    await posePass(frame, p.crop, p.flip),
+                  ],
                   Promise.resolve([]),
                 );
           return { box, points: fusePoses(poses) };
@@ -640,8 +673,39 @@ async function run(job: Job) {
         } else {
           for (const box of boxes) detections.push(await analyseBox(box));
         }
-        frames.push(...tracker.update(detections, time));
+        const tracked = tracker.update(detections, time);
+        frames.push(...tracked);
         timestamps.push(time);
+        // Bound UI work and transfer only the latest frame, never the history.
+        const now = performance.now();
+        if (now - lastPreview >= 200) {
+          lastPreview = now;
+          const width = frame.displayWidth,
+            height = frame.displayHeight;
+          const scale = Math.min(1, 960 / width);
+          const preview = new OffscreenCanvas(
+            Math.max(1, Math.round(width * scale)),
+            Math.max(1, Math.round(height * scale)),
+          );
+          preview
+            .getContext("2d")!
+            .drawImage(frame, 0, 0, preview.width, preview.height);
+          const bitmap = preview.transferToImageBitmap();
+          postMessage(
+            {
+              type: "preview",
+              payload: {
+                bitmap,
+                width,
+                height,
+                time,
+                processed: timestamps.length,
+                frames: tracked,
+              },
+            },
+            [bitmap],
+          );
+        }
       },
       (v) => send("progress", v * 0.94),
     );
