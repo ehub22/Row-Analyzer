@@ -69,6 +69,11 @@ import {
   validateSession,
 } from "./core/export";
 import { jointNames } from "./core/keypoints";
+import {
+  planParallelism,
+  readParallelEnv,
+  summarizePlan,
+} from "./core/parallel";
 const tabs = ["Overview", "Crew timing", "Compare", "Keyframe labels"];
 const metricNames = [
   "Catch shin angle",
@@ -120,19 +125,22 @@ function App() {
   const upload = useRef<HTMLInputElement>(null),
     importSession = useRef<HTMLInputElement>(null),
     importCompare = useRef<HTMLInputElement>(null),
-    worker = useRef<Worker | null>(null);
+    worker = useRef<Worker | null>(null),
+    poseWorkers = useRef<Worker[]>([]);
+  /** Terminates the coordinator and every pose-pool worker. */
+  function stopWorkers() {
+    worker.current?.terminate();
+    worker.current = null;
+    for (const w of poseWorkers.current) w.terminate();
+    poseWorkers.current = [];
+  }
   const busy = progress !== null;
   const currentBoat = session?.boat || boat;
   const rows = session?.strokes.filter((s) => crew || s.seat === seat) || [];
   const rate = mean(rows.map((s) => s.rate.value)),
     ratio = mean(rows.map((s) => s.ratio.value)),
     confidence = mean(rows.map((s) => s.confidence));
-  useEffect(
-    () => () => {
-      worker.current?.terminate();
-    },
-    [],
-  );
+  useEffect(() => () => stopWorkers(), []);
   useEffect(
     () => () => {
       if (url) URL.revokeObjectURL(url);
@@ -209,7 +217,7 @@ function App() {
       setError("Please trim your video to 300 MB or smaller.");
       return;
     }
-    worker.current?.terminate();
+    stopWorkers();
     setProgress(null);
     setVideoFile(file);
     setUrl(URL.createObjectURL(file));
@@ -229,7 +237,7 @@ function App() {
     );
   }
   function demo() {
-    worker.current?.terminate();
+    stopWorkers();
     setProgress(null);
     const s = createDemo(boat);
     setSession(s);
@@ -373,11 +381,45 @@ function App() {
     const models = await prepareModels(token);
     if (!models || token !== runToken.current) return;
     setStatus("Starting private analysis…");
+    stopWorkers();
     const w = new Worker(
       new URL("./workers/analysis.worker.ts", import.meta.url),
       { type: "module" },
     );
     worker.current = w;
+    // Spawn the pose-worker pool on the main thread (nested workers are not
+    // available in every browser) and connect each pose worker directly to
+    // the coordinator with a MessageChannel, so tensors never relay through
+    // this UI thread. The coordinator initialises the pool lazily — if
+    // WebGPU works it is never used — and falls back to a local session if
+    // pool startup fails for any reason.
+    const plan = planParallelism(readParallelEnv(), settings.workers);
+    try {
+      for (let i = 0; i < plan.poseWorkers; i++) {
+        const pw = new Worker(
+          new URL("./workers/pose.worker.ts", import.meta.url),
+          { type: "module" },
+        );
+        const channel = new MessageChannel();
+        w.postMessage({ type: "pool-port" }, [channel.port1]);
+        pw.postMessage({ type: "connect" }, [channel.port2]);
+        pw.onerror = (e) => {
+          try {
+            w.postMessage({
+              type: "pool-error",
+              index: i,
+              error: e.message || "pose worker error",
+            });
+          } catch {
+            /* coordinator already gone */
+          }
+        };
+        poseWorkers.current.push(pw);
+      }
+    } catch {
+      // Worker construction itself failed (very old browser / CSP): the
+      // coordinator runs pose inference on its local session instead.
+    }
     w.onmessage = (e) => {
       const { type, payload } = e.data;
       if (type === "progress") setProgress(payload);
@@ -391,18 +433,18 @@ function App() {
         setToast(
           "Analysis complete. Review seat identity and evidence before interpreting results.",
         );
-        w.terminate();
+        stopWorkers();
       }
       if (type === "error") {
         setError(payload);
         setProgress(null);
-        w.terminate();
+        stopWorkers();
       }
     };
     w.onerror = (e) => {
       setError(`Analysis worker failed: ${e.message}`);
       setProgress(null);
-      w.terminate();
+      stopWorkers();
     };
     w.postMessage({
       file: videoFile,
@@ -410,6 +452,7 @@ function App() {
       pose: models.p,
       settings,
       boat,
+      parallel: plan,
     });
   }
   function correct(c: Correction) {
@@ -532,7 +575,7 @@ function App() {
         <button
           className="new-session"
           onClick={() => {
-            worker.current?.terminate();
+            stopWorkers();
             setProgress(null);
             setSession(null);
             setBaseline(null);
@@ -1056,7 +1099,7 @@ function App() {
                         onClick={() => {
                           runToken.current++;
                           downloadAbort.current?.abort();
-                          worker.current?.terminate();
+                          stopWorkers();
                           setProgress(null);
                           setStatus("");
                           setToast(
@@ -1624,6 +1667,46 @@ function App() {
                     />
                   </label>
                 </div>
+                <div className="two-fields">
+                  <label>
+                    Parallel pose workers
+                    <select
+                      aria-label="Parallel pose workers"
+                      value={settings.workers}
+                      onChange={(e) =>
+                        setSettings({ ...settings, workers: +e.target.value })
+                      }
+                    >
+                      <option value={0}>Auto (recommended)</option>
+                      {[1, 2, 3, 4, 6, 8].map((n) => (
+                        <option key={n} value={n}>
+                          {n} worker{n === 1 ? "" : "s"}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
+                    Your machine
+                    <input
+                      aria-label="Parallel processing plan"
+                      readOnly
+                      value={summarizePlan(
+                        planParallelism(readParallelEnv(), settings.workers),
+                      )}
+                    />
+                  </label>
+                </div>
+                <p className="note">
+                  Pose inference — the slow part — runs in parallel across
+                  these workers, one model session each, so it scales with
+                  your CPU cores even where WebGPU is unavailable. More
+                  workers are faster but each loads its own copy of the pose
+                  model (~134 MB for DWPose-l), so Auto leaves a core free
+                  for decoding and caps the pool at 4. Threaded WASM per
+                  worker additionally needs cross-origin isolation
+                  (COOP/COEP); the deployed site enables that with a service
+                  worker after one reload.
+                </p>
                 <details className="region-settings">
                   <summary>
                     Detection region · exclude the coxswain / bystanders
@@ -1672,8 +1755,9 @@ function App() {
                   <span>
                     <strong>Flip + multi-scale test-time augmentation</strong>
                     <small>
-                      Four passes per crop. Slower processing; preserves
-                      confidence and flags disagreement.
+                      Four passes per crop, distributed across the pose
+                      workers. Slower processing; preserves confidence and
+                      flags disagreement.
                     </small>
                   </span>
                 </label>
@@ -1688,7 +1772,10 @@ function App() {
                   <span>
                     <strong>Force WASM compatibility mode</strong>
                     <small>
-                      Otherwise request WebGPU, with an automatic WASM fallback.
+                      Otherwise WebGPU is requested and probed with a warm-up
+                      run; if it fails — as it does for these models on many
+                      Chrome/Firefox/Safari setups — analysis automatically
+                      falls back to the parallel WASM worker pool.
                     </small>
                   </span>
                 </label>

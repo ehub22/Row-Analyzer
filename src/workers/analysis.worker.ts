@@ -9,6 +9,13 @@ import { checkDetectorContract, checkPoseContract } from "../core/compat";
 import { recoverOcclusion } from "../core/occlusion";
 import { segmentStrokes } from "../core/strokes";
 import { estimateCamera } from "../core/geometry";
+import {
+  planParallelism,
+  readParallelEnv,
+  summarizePlan,
+  type ParallelPlan,
+} from "../core/parallel";
+import { PoseWorkerPool, type PoseJob } from "../core/pool";
 import type {
   Boat,
   ModelSettings,
@@ -17,32 +24,94 @@ import type {
   Session,
   Box,
 } from "../core/types";
+
 interface Job {
   file: File;
   detector: File;
   pose: File;
   settings: ModelSettings;
   boat: Boat;
+  /** Plan computed by the main thread (it also sizes the worker pool). */
+  parallel?: ParallelPlan;
 }
+
 const send = (type: string, payload: unknown) => postMessage({ type, payload });
-ort.env.wasm.numThreads = 1;
-ort.env.wasm.wasmPaths = { wasm: wasmUrl, mjs: wasmModule };
-async function model(file: File, forceWasm: boolean) {
-  const bytes = await file.arrayBuffer();
-  if (!forceWasm)
+const errText = (e: unknown) =>
+  (e instanceof Error ? e.message : String(e)).slice(0, 300);
+
+// MessagePorts to the pose-worker pool, connected by the main thread before
+// the job message arrives (see App.tsx). Empty when the pool is unavailable,
+// in which case pose inference runs on a local session exactly as before.
+const poolPorts: MessagePort[] = [];
+// The pool of the currently running job, so transport-level worker errors
+// relayed by the main thread ("pool-error") can mark endpoints dead.
+let activePool: PoseWorkerPool | null = null;
+
+interface LoadedModel {
+  session: ort.InferenceSession;
+  provider: "WebGPU" | "WASM";
+}
+
+const webgpuAvailable = (): boolean => {
+  try {
+    return Boolean(
+      (globalThis as { navigator?: { gpu?: unknown } }).navigator?.gpu,
+    );
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * Creates a session, preferring WebGPU when allowed. A WebGPU session that
+ * *creates* can still fail on its first real inference (unsupported operator,
+ * buffer-size limits on large fp32 models, driver blocklists — seen on
+ * Chrome/Linux/macOS, Firefox and Safari), so WebGPU candidates must pass a
+ * warm-up inference with a zero tensor before any video is decoded. Any
+ * failure falls back to WASM and is reported, never silently swallowed.
+ */
+async function loadModel(
+  bytes: ArrayBuffer,
+  name: string,
+  opts: {
+    forceWasm: boolean;
+    probeDims: (session: ort.InferenceSession) => number[];
+    notes: string[];
+  },
+): Promise<LoadedModel> {
+  if (!opts.forceWasm && webgpuAvailable()) {
     try {
-      return {
-        session: await ort.InferenceSession.create(bytes, {
-          executionProviders: ["webgpu"],
-        }),
-        provider: "WebGPU",
-      };
+      const session = await ort.InferenceSession.create(bytes, {
+        executionProviders: ["webgpu"],
+      });
+      try {
+        const dims = opts.probeDims(session);
+        const probe = new ort.Tensor(
+          "float32",
+          new Float32Array(dims.reduce((a, b) => a * b, 1)),
+          dims,
+        );
+        try {
+          const out = await session.run({ [session.inputNames[0]]: probe });
+          Object.values(out).forEach((t) => t.dispose());
+        } finally {
+          probe.dispose();
+        }
+        return { session, provider: "WebGPU" };
+      } catch (e) {
+        await session.release().catch(() => {});
+        throw e;
+      }
     } catch (e) {
-      send(
-        "status",
-        `WebGPU unavailable for ${file.name}; retrying WASM. ${String(e).slice(0, 100)}`,
-      );
+      const note = `WebGPU failed for ${name} (${errText(e)}); using WASM instead.`;
+      opts.notes.push(note);
+      send("status", note);
     }
+  } else if (!opts.forceWasm) {
+    opts.notes.push(
+      `WebGPU is not exposed by this browser (navigator.gpu missing); using WASM for ${name}.`,
+    );
+  }
   return {
     session: await ort.InferenceSession.create(bytes, {
       executionProviders: ["wasm"],
@@ -50,8 +119,27 @@ async function model(file: File, forceWasm: boolean) {
     provider: "WASM",
   };
 }
+
+/** Fixed input dims from session metadata, with a per-index fallback. */
+function probeDimsFrom(
+  session: ort.InferenceSession,
+  fallback: number[],
+): number[] {
+  const meta = session.inputMetadata[0] as
+    | { shape?: readonly (number | string)[] }
+    | undefined;
+  const shape = meta?.shape ?? [];
+  return fallback.map((f, i) =>
+    typeof shape[i] === "number" && (shape[i] as number) > 0
+      ? (shape[i] as number)
+      : f,
+  );
+}
+
 const canvas = new OffscreenCanvas(640, 640);
 const ctx = canvas.getContext("2d", { willReadFrequently: true })!;
+const POSE_MEAN = [123.675, 116.28, 103.53];
+const POSE_STD = [58.395, 57.12, 57.375];
 function tensor(
   frame: VideoFrame,
   w: number,
@@ -83,19 +171,29 @@ function tensor(
   }
   ctx.restore();
   const pixels = ctx.getImageData(0, 0, w, h).data,
-    data = new Float32Array(3 * w * h);
-  for (let i = 0; i < w * h; i++)
+    plane = w * h,
+    data = new Float32Array(3 * plane);
+  // Channel-major loops with the mode branch hoisted out: this runs once per
+  // crop/TTA pass (up to 32× per frame), so per-pixel branching added up.
+  if (mode === "pose") {
     for (let c = 0; c < 3; c++) {
-      const p = pixels[i * 4 + (mode === "yolox" ? 2 - c : c)];
-      data[c * w * h + i] =
-        mode === "pose"
-          ? (p - [123.675, 116.28, 103.53][c]) / [58.395, 57.12, 57.375][c]
-          : mode === "yolo"
-            ? p / 255
-            : p;
+      const off = c * plane, mean = POSE_MEAN[c], inv = 1 / POSE_STD[c];
+      for (let i = 0; i < plane; i++) data[off + i] = (pixels[i * 4 + c] - mean) * inv;
     }
+  } else if (mode === "yolox") {
+    for (let c = 0; c < 3; c++) {
+      const off = c * plane, src = 2 - c; // BGR
+      for (let i = 0; i < plane; i++) data[off + i] = pixels[i * 4 + src];
+    }
+  } else {
+    for (let c = 0; c < 3; c++) {
+      const off = c * plane;
+      for (let i = 0; i < plane; i++) data[off + i] = pixels[i * 4 + c] / 255;
+    }
+  }
   return new ort.Tensor("float32", data, [1, 3, h, w]);
 }
+
 async function infer(session: ort.InferenceSession, input: ort.Tensor) {
   try {
     return await session.run({ [session.inputNames[0]]: input });
@@ -103,40 +201,283 @@ async function infer(session: ort.InferenceSession, input: ort.Tensor) {
     input.dispose();
   }
 }
+
+/** Decodes one local pose inference into source-image points (unflipped). */
+function decodePoseOutputs(
+  session: ort.InferenceSession,
+  outputs: Record<string, ort.Tensor>,
+  format: "simcc" | "heatmap",
+  crop: Box,
+  flip: boolean,
+): Point[] {
+  const vals = session.outputNames.map((n) => outputs[n]);
+  let points: Point[];
+  if (format === "simcc") {
+    if (
+      vals.length !== 2 ||
+      vals[0].dims.length !== 3 ||
+      vals[0].dims[1] !== 133 ||
+      vals[1].dims[1] !== 133
+    )
+      throw Error(
+        "Expected a 133-joint whole-body SimCC export, not a 17-joint body model.",
+      );
+    points = decodeSimCC(
+      vals[0].data as Float32Array,
+      vals[1].data as Float32Array,
+      vals[0].dims[2],
+      vals[1].dims[2],
+      crop,
+    );
+  } else {
+    if (vals[0].dims.length !== 4 || vals[0].dims[1] !== 133)
+      throw Error("Expected [1,133,H,W] heatmaps.");
+    points = decodeHeatmap(
+      vals[0].data as Float32Array,
+      vals[0].dims[3],
+      vals[0].dims[2],
+      crop,
+    );
+  }
+  return flip ? unflip(points, crop) : points;
+}
+
 async function run(job: Job) {
+  const plan: ParallelPlan =
+    job.parallel ??
+    planParallelism(readParallelEnv(), job.settings.workers);
+  // ORT reads wasmPaths/numThreads when the WASM backend initialises (first
+  // session in this worker). Threaded WASM only engages on cross-origin-
+  // isolated pages; planParallelism already caps threads at 1 otherwise.
+  ort.env.wasm.numThreads = plan.detectorThreads;
+  ort.env.wasm.wasmPaths = { wasm: wasmUrl, mjs: wasmModule };
+
+  const notes: string[] = [];
   send("status", "Loading detector and whole-body pose model…");
-  const d = await model(job.detector, job.settings.wasm);
-  let p: Awaited<ReturnType<typeof model>> | undefined;
+  send("status", `Parallel plan: ${summarizePlan(plan)}.`);
+
+  const detectorBytes = await job.detector.arrayBuffer();
+  const poseBytes = await job.pose.arrayBuffer();
+  const d = await loadModel(detectorBytes, job.detector.name, {
+    forceWasm: job.settings.wasm,
+    probeDims: (s) => probeDimsFrom(s, [1, 3, 640, 640]),
+    notes,
+  });
+
+  // Pose execution strategy, in order:
+  //  1. a probed WebGPU session in this worker (pool never initialised);
+  //  2. the parallel WASM pose-worker pool (main thread supplied the ports);
+  //  3. a local WASM session — also the fallback if the pool dies mid-run.
+  let localPose: LoadedModel | null = null;
+  let pool: PoseWorkerPool | null = null;
+  let poolAlive = false;
+  let poseProvider = "";
+
+  if (!job.settings.wasm && webgpuAvailable()) {
+    const attempt = await loadModel(poseBytes, job.pose.name, {
+      forceWasm: false,
+      probeDims: (s) =>
+        probeDimsFrom(s, [1, 3, job.settings.height, job.settings.width]),
+      notes,
+    });
+    if (attempt.provider === "WebGPU") {
+      localPose = attempt;
+      poseProvider = "WebGPU";
+    } else {
+      // loadModel already fell back to a WASM session; keep it only as the
+      // emergency fallback and prefer the pool for actual inference.
+      localPose = attempt;
+    }
+  }
+
+  if (!localPose || localPose.provider !== "WebGPU") {
+    if (poolPorts.length) {
+      pool = new PoseWorkerPool(
+        poolPorts.map((port) => ({
+          send: (message: unknown, transfer?: Transferable[]) => {
+            if (transfer) port.postMessage(message, transfer);
+            else port.postMessage(message);
+          },
+        })),
+      );
+      // Wire inbound port events into the pool's dispatcher.
+      poolPorts.forEach((port, i) => {
+        port.onmessage = (e: MessageEvent) => pool?.handleMessage(i, e.data);
+        port.onmessageerror = () => pool?.handleError(i, new Error("Pose worker port error."));
+      });
+      pool.init({
+        // The File is a blob reference: each worker reads its own copy,
+        // instead of structured-cloning a ~134 MB ArrayBuffer per worker.
+        poseFile: job.pose,
+        format: job.settings.format,
+        width: job.settings.width,
+        height: job.settings.height,
+        wasmThreads: plan.wasmThreads,
+      });
+      activePool = pool;
+      try {
+        // A pose worker whose script fails to load never answers init;
+        // without this timeout the run would hang instead of falling back.
+        await Promise.race([
+          pool.ready(),
+          new Promise<never>((_, reject) =>
+            setTimeout(
+              () => reject(new Error("pose workers did not start within 120 s")),
+              120_000,
+            ),
+          ),
+        ]);
+        // ready() resolves on the first worker; give the rest a brief grace
+        // period to finish session creation so early frames (and the
+        // reported worker count) use the whole pool, not just the fastest.
+        const graceDeadline = Date.now() + 5_000;
+        while (pool.settledCount < pool.size && Date.now() < graceDeadline)
+          await new Promise((r) => setTimeout(r, 100));
+        poolAlive = true;
+        // The pool is healthy: release the emergency local session (created
+        // when the WebGPU probe fell back) instead of holding a fifth copy
+        // of the pose model in RAM. ensureLocalPose() recreates it on the
+        // unlikely chance every pool worker dies mid-run.
+        if (localPose) {
+          await localPose.session.release().catch(() => {});
+          localPose = null;
+        }
+        if (pool.aliveCount < pool.size)
+          notes.push(
+            `Only ${pool.aliveCount} of ${pool.size} pose workers started; continuing with reduced parallelism.`,
+          );
+        poseProvider = `WASM pool (${pool.aliveCount} worker${pool.aliveCount === 1 ? "" : "s"} × ${plan.wasmThreads} thread${plan.wasmThreads === 1 ? "" : "s"})`;
+      } catch (e) {
+        notes.push(
+          `Pose worker pool unavailable (${errText(e)}); using one local WASM pose session.`,
+        );
+        pool.dispose();
+        pool = null;
+      }
+    }
+    if (!poolAlive && !localPose) {
+      localPose = await loadModel(poseBytes, job.pose.name, {
+        forceWasm: true,
+        probeDims: (s) =>
+          probeDimsFrom(s, [1, 3, job.settings.height, job.settings.width]),
+        notes,
+      });
+    }
+    if (!poolAlive && localPose)
+      poseProvider = `WASM (${plan.detectorThreads} thread${plan.detectorThreads === 1 ? "" : "s"})`;
+  }
+
   try {
-    p = await model(job.pose, job.settings.wasm);
-    const poseSession = p.session;
     const tensorShape = (m: {
       isTensor: boolean;
       shape?: readonly (number | string)[];
     }) => (m.isTensor && m.shape ? m.shape : []);
     const detectorIn = tensorShape(d.session.inputMetadata[0]);
     const detectorOut = tensorShape(d.session.outputMetadata[0]);
-    const poseIn = tensorShape(poseSession.inputMetadata[0]);
-    const poseOuts = poseSession.outputMetadata.map(tensorShape);
-    // Fail fast on contract mismatches before decoding any frame.
+    // Fail fast on contract mismatches before decoding any frame. In pool
+    // mode each pose worker already ran checkPoseContract during init (a
+    // bad model kills every worker, pool.ready() rejects, and the local
+    // fallback session created above then throws the precise error here).
     checkDetectorContract(detectorIn, detectorOut, job.settings.detector);
-    checkPoseContract(
-      poseIn,
-      poseOuts,
-      job.settings.format,
-      job.settings.width,
-      job.settings.height,
-    );
+    if (localPose) {
+      checkPoseContract(
+        tensorShape(localPose.session.inputMetadata[0]),
+        localPose.session.outputMetadata.map(tensorShape),
+        job.settings.format,
+        job.settings.width,
+        job.settings.height,
+      );
+    }
     const shape = detectorIn;
     const size = typeof shape[2] === "number" ? shape[2] : 640;
     if (size !== shape[3] && typeof shape[3] === "number")
       throw Error("Detector must have a square NCHW input.");
+
+    // Memoised so concurrent pool failures create exactly one fallback.
+    let localPosePromise: Promise<LoadedModel> | null = null;
+    const ensureLocalPose = async (): Promise<LoadedModel> => {
+      if (localPose) return localPose;
+      localPosePromise ??= (async () => {
+        const m = await loadModel(poseBytes, job.pose.name, {
+          forceWasm: true,
+          probeDims: (s) =>
+            probeDimsFrom(s, [1, 3, job.settings.height, job.settings.width]),
+          notes,
+        });
+        checkPoseContract(
+          tensorShape(m.session.inputMetadata[0]),
+          m.session.outputMetadata.map(tensorShape),
+          job.settings.format,
+          job.settings.width,
+          job.settings.height,
+        );
+        return m;
+      })();
+      localPose = await localPosePromise;
+      return localPose;
+    };
+
+    /** Runs one crop/TTA pass, on the pool when active, else locally. */
+    const posePass = async (
+      frame: VideoFrame,
+      crop: Box,
+      flip: boolean,
+    ): Promise<Point[]> => {
+      if (pool && poolAlive) {
+        const t = tensor(
+          frame,
+          job.settings.width,
+          job.settings.height,
+          crop,
+          flip,
+          "pose",
+        );
+        const jobArg: PoseJob = {
+          data: t.data as Float32Array,
+          dims: [1, 3, job.settings.height, job.settings.width],
+          crop,
+          flip,
+          format: job.settings.format,
+        };
+        try {
+          // Note: dispatch transfers the tensor buffer, so a retry must
+          // rebuild the tensor — handled by falling through to local below.
+          return await pool.dispatch(jobArg);
+        } catch (e) {
+          if (poolAlive) {
+            poolAlive = false;
+            notes.push(
+              `A pose worker failed mid-analysis (${errText(e)}); finishing on the local WASM session. Speed is reduced for the rest of this run.`,
+            );
+            send("status", "Pose worker failed; continuing on the local session.");
+          }
+          await ensureLocalPose();
+        }
+      }
+      const session = (await ensureLocalPose()).session;
+      const outputs = await infer(
+        session,
+        tensor(frame, job.settings.width, job.settings.height, crop, flip, "pose"),
+      );
+      try {
+        return decodePoseOutputs(
+          session,
+          outputs,
+          job.settings.format,
+          crop,
+          flip,
+        );
+      } finally {
+        Object.values(outputs).forEach((t) => t.dispose());
+      }
+    };
+
     const tracker = new SeatTracker(job.boat),
       frames: PoseFrame[] = [],
       timestamps: number[] = [];
     send(
       "status",
-      "Decoding every frame · detecting people · estimating 133 joints",
+      `Decoding every frame · detecting people · estimating 133 joints · pose via ${poseProvider}`,
     );
     const meta = await decodeVideo(
       job.file,
@@ -178,64 +519,33 @@ async function run(job: Job) {
         } finally {
           Object.values(out).forEach((t) => t.dispose());
         }
+        // All crop/TTA passes for this frame are independent: run them
+        // concurrently across the pool (results reassembled in the original
+        // order for fusePoses). A local session stays strictly sequential.
+        const scales = job.settings.tta ? [1.25, 1.5] : [1.25];
+        const flips = job.settings.tta ? [false, true] : [false];
         const detections: { box: Box; points: Point[] }[] = [];
-        for (const box of boxes) {
-          const poses: Point[][] = [];
-          for (const scale of job.settings.tta ? [1.25, 1.5] : [1.25])
-            for (const flip of job.settings.tta ? [false, true] : [false]) {
-              const crop = paddedCrop(
-                box,
-                job.settings.width,
-                job.settings.height,
-                scale,
-              );
-              const outputs = await infer(
-                poseSession,
-                tensor(
-                  frame,
-                  job.settings.width,
-                  job.settings.height,
-                  crop,
-                  flip,
-                  "pose",
-                ),
-              );
-              try {
-                const vals = poseSession.outputNames.map((n) => outputs[n]);
-                let points: Point[];
-                if (job.settings.format === "simcc") {
-                  if (
-                    vals.length !== 2 ||
-                    vals[0].dims.length !== 3 ||
-                    vals[0].dims[1] !== 133 ||
-                    vals[1].dims[1] !== 133
-                  )
-                    throw Error(
-                      "Expected a 133-joint whole-body SimCC export, not a 17-joint body model.",
-                    );
-                  points = decodeSimCC(
-                    vals[0].data as Float32Array,
-                    vals[1].data as Float32Array,
-                    vals[0].dims[2],
-                    vals[1].dims[2],
-                    crop,
-                  );
-                } else {
-                  if (vals[0].dims.length !== 4 || vals[0].dims[1] !== 133)
-                    throw Error("Expected [1,133,H,W] heatmaps.");
-                  points = decodeHeatmap(
-                    vals[0].data as Float32Array,
-                    vals[0].dims[3],
-                    vals[0].dims[2],
-                    crop,
-                  );
-                }
-                poses.push(flip ? unflip(points, crop) : points);
-              } finally {
-                Object.values(outputs).forEach((t) => t.dispose());
-              }
-            }
-          detections.push({ box, points: fusePoses(poses) });
+        const analyseBox = async (box: Box) => {
+          const passes: { crop: Box; flip: boolean }[] = [];
+          for (const scale of scales)
+            for (const flip of flips)
+              passes.push({
+                crop: paddedCrop(box, job.settings.width, job.settings.height, scale),
+                flip,
+              });
+          const poses =
+            pool && poolAlive
+              ? await Promise.all(passes.map((p) => posePass(frame, p.crop, p.flip)))
+              : await passes.reduce<Promise<Point[][]>>(
+                  async (acc, p) => [...(await acc), await posePass(frame, p.crop, p.flip)],
+                  Promise.resolve([]),
+                );
+          return { box, points: fusePoses(poses) };
+        };
+        if (pool && poolAlive) {
+          detections.push(...(await Promise.all(boxes.map(analyseBox))));
+        } else {
+          for (const box of boxes) detections.push(await analyseBox(box));
         }
         frames.push(...tracker.update(detections, time));
         timestamps.push(time);
@@ -266,21 +576,44 @@ async function run(job: Job) {
               `Decoder emitted ${timestamps.length} of ${meta.samples.length} encoded samples; missing frames remain absent. Timing resolution is limited by the actual decoded timestamps.`,
             ]
           : []),
+        ...notes,
+        ...(plan.crossOriginIsolated
+          ? []
+          : [
+              "Cross-origin isolation is off: each WASM session runs single-threaded and parallelism comes from the pose-worker pool. Serving with COOP/COEP headers (on GitHub Pages the bundled isolation service worker does this after one reload) unlocks threaded WASM per session.",
+            ]),
         "Experimental tracking: review seat identity and keypoints before coaching.",
         "Catch/finish events are hip-to-ankle cycle proxies, not directly observed blade entry/release.",
         "3D camera normalization, oar tracking, and depth-dependent biomechanics are not validated and are withheld.",
       ],
       model: `${job.detector.name} + ${job.pose.name}; ${job.settings.width}×${job.settings.height}; ${job.settings.tta ? "flip + multi-scale TTA" : "single pass"}`,
-      provider: `${d.provider} / ${p.provider}`,
+      provider: `${d.provider} detector / ${poseProvider} pose`,
     };
     send("result", session);
   } finally {
+    pool?.dispose();
+    activePool = null;
     await d.session.release();
-    if (p) await p.session.release();
+    if (localPose) await localPose.session.release();
   }
 }
-self.onmessage = (event: MessageEvent<Job>) => {
-  run(event.data).catch((e) =>
+
+self.onmessage = (event: MessageEvent<Job | { type: string }>) => {
+  const data = event.data as { type?: string; index?: number; error?: string };
+  if (data?.type === "pool-port") {
+    const port = (event as MessageEvent).ports?.[0];
+    if (port) poolPorts.push(port);
+    return;
+  }
+  if (data?.type === "pool-error") {
+    if (typeof data.index === "number")
+      activePool?.handleError(
+        data.index,
+        new Error(data.error || "Pose worker error."),
+      );
+    return;
+  }
+  run(event.data as Job).catch((e) =>
     send("error", e instanceof Error ? e.message : String(e)),
   );
 };

@@ -11,7 +11,7 @@ A private, offline rowing-video review workbench for desktop Chrome. **Research 
 
 - Local MP4/MOV upload and native playback, slow motion, scrubbing, decoded-timestamp frame stepping after analysis.
 - WebCodecs + MP4Box decoder, worker/OffscreenCanvas preprocessing, bounded decoded-frame queue, progress and cancellation.
-- Browser ONNX Runtime Web pipeline with WebGPU request / WASM fallback. **Requires separately imported authentic detector and whole-body model weights.**
+- Browser ONNX Runtime Web pipeline: WebGPU is probed with a warm-up inference and automatically falls back to a **parallel WASM pose-worker pool** (one session per worker, sized to your CPU cores) when WebGPU is unavailable — as it is on many Chrome/Firefox/Safari setups. Threaded WASM additionally activates when the page is cross-origin isolated (COOP/COEP; the bundled service worker enables this on GitHub Pages). **Requires separately imported authentic detector and whole-body model weights.**
 - Top-down YOLOX / YOLOv8/11 detector adapters, aspect-correct padded crops, 133-joint SimCC or heatmap pose adapters, sub-pixel decoding, four-pass flip/multi-scale coordinate fusion.
 - Global seat assignment with ambiguity gates; short bidirectional gap filling; observed/inferred/manual/missing provenance; low-confidence jump rejection.
 - Per-seat and crew review; catch/finish **body-motion proxies**, stroke rate, drive-to-recovery ratio, crew timing in milliseconds and phase degrees.
@@ -43,7 +43,7 @@ npm run test:e2e       # production-browser workflow tests
 ## Use
 
 1. Import a short MP4/MOV clip (up to 300 MB, 20,000 decoded-frame guard). Choose the shell, rigging, seat count, best-visible seat, and bow direction in the image.
-2. Open **Models & settings**. When the build has model URLs configured, the detector and whole-body models download automatically on the first analysis (with progress) and are cached in this browser. Otherwise import compatible ONNX files from your device. Set input dimensions/format to match the export. Enable flip/multi-scale TTA for four passes per crop.
+2. Open **Models & settings**. When the build has model URLs configured, the detector and whole-body models download automatically on the first analysis (with progress) and are cached in this browser. Otherwise import compatible ONNX files from your device. Set input dimensions/format to match the export. Enable flip/multi-scale TTA for four passes per crop. **Parallel pose workers** controls how many CPU workers share those passes (Auto is right for most machines; each extra worker loads another copy of the pose model).
 3. If needed, use the detection-region percentage bounds to exclude bystanders/coxswain detection centers. This is a static region; the crew must stay inside it.
 4. Analyze. All decoded frames are submitted. Initialization stops if detected people do not match configured seats, rather than silently assigning incorrect identities.
 5. Verify identity, observations, and occlusion. Use **Keyframe labels** to correct only visible joints. Select a joint and click to add a missing observation, or drag an existing point.
@@ -64,13 +64,15 @@ The synthetic demo works without model downloads and is always marked as synthet
 | `src/core/occlusion.ts` | short-gap recovery, jump rejection, manual refit |
 | `src/core/strokes.ts` | body-motion cycle proxies, evidence gating, crew synchronization |
 | `src/core/export.ts` | sessions, partial training labels, CSV and PDF |
+| `src/core/parallel.ts` / `src/core/pool.ts` | worker-pool + WASM-thread planning; least-busy pose job dispatch with failover |
 | `src/workers/analysis.worker.ts` | ONNX sessions and offline pipeline orchestration |
+| `src/workers/pose.worker.ts` | one pooled pose-inference session (×N, connected by MessageChannel) |
 
 ## Privacy and deployment
 
 `google_drive/`, `private/`, `.cache/`, media, and model binaries are ignored. Downloaded sample videos, extracted frames, and athlete imagery are never included in the repository or Pages build. No sample Drive IDs are needed by the published app. Only `dist/` is uploaded by the Pages workflow.
 
-Pages uses GitHub Actions, not a generated `gh-pages` branch. Build/test runs on the working branch `arena/d1e71cca-row-analyzer`. Publication runs after the pull request is merged into `main`, honoring the existing Pages environment policy. Relative asset URLs support `/Row-Analyzer/`. Single-thread WASM does not require COOP/COEP headers, which GitHub Pages cannot configure.
+Pages uses GitHub Actions, not a generated `gh-pages` branch. Build/test runs on the working branch `arena/d1e71cca-row-analyzer`. Publication runs after the pull request is merged into `main`, honoring the existing Pages environment policy. Relative asset URLs support `/Row-Analyzer/`. GitHub Pages cannot set the COOP/COEP headers that threaded WASM requires, so `public/coi-serviceworker.js` adds them from a service worker after one reload; the pose-worker pool keeps analysis parallel even where that is unavailable.
 
 ## Modeling principles
 
