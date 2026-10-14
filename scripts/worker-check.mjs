@@ -1,10 +1,7 @@
 import { chromium } from "playwright";
-import chrome from "@sparticuz/chromium";
-const browser = await chromium.launch({
-  executablePath: await chrome.executablePath(),
-  args: chrome.args,
-  headless: true,
-});
+import { resolveChromium } from "./lib/chromium.mjs";
+const { executablePath, args, env } = await resolveChromium();
+const browser = await chromium.launch({ executablePath, args, env, headless: true });
 const page = await browser.newPage();
 page.on("requestfailed", (r) =>
   console.log("REQUEST FAILED", r.url(), r.failure()),
@@ -19,7 +16,7 @@ await page
   .first()
   .setInputFiles("private/test-models/short.mp4");
 await page.getByLabel("Boat class").selectOption("Single");
-await page.getByRole("button", { name: "Configure whole-body models" }).click();
+await page.getByRole("button", { name: "Models & settings" }).click();
 await page
   .getByLabel("Detector model", { exact: true })
   .setInputFiles("private/test-models/TEST-ONLY-detector.onnx");
@@ -33,9 +30,10 @@ await page
   .waitForFunction(
     () =>
       document.querySelector(".alert.error") ||
-      document.querySelector(".stage-badges"),
+      document.querySelector(".analysis-notes") ||
+      document.querySelector(".demo-notice"),
     {},
-    { timeout: 60000 },
+    { timeout: Number(process.env.TIMEOUT ?? 300000)},
   )
   .catch(async () => {
     console.log(
@@ -47,7 +45,7 @@ await page
 console.log(
   (await page.locator(".alert.error").count())
     ? await page.locator(".alert.error").innerText()
-    : (await page.locator(".stage-badges").count())
+    : (await page.locator(".analysis-notes").count())
       ? "SUCCESS: full decode → WASM detector/pose test doubles → seat tracking → report; no genuine tracking validation"
       : "INCOMPLETE",
 );

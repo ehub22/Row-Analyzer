@@ -1001,6 +1001,21 @@ table td i {
   color: #9aa78e;
   margin-top: 8px;
 }
+.runtime-line {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 4px;
+  margin-top: 6px;
+  padding: 5px 8px;
+  border-radius: 8px;
+  background: #eef3ea;
+  font-size: 9px;
+  color: #3f5245;
+  text-align: center;
+  word-break: break-word;
+}
+
 .setup-footnote {
   display: flex;
   justify-content: center;

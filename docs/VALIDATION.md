@@ -100,3 +100,28 @@ Until these gates pass, normalized angles, layback, twist, sequencing faults, sc
 ## Publication status
 
 Code and GitHub Actions configuration are on the working branch. GitHub CI build, all unit tests and all six browser tests passed. The initial Pages enablement request returned 403; subsequent inspection confirmed Pages is configured for Actions but its environment allows only `main`. The first session-branch deployment was rejected by that protection. The workflow now publishes only main-branch merges, without modifying environment policy. See GitHub Actions for the final deployment result.
+
+## GPU regression fix — engineering checks (2026-10-14)
+
+**The failure the user reported was an application bug, not a device limitation.** The analysis worker pinned `onnxruntime-web/dist/ort-wasm-simd-threaded.jsep.{mjs,wasm}` through `ort.env.wasm.wasmPaths` while importing the `onnxruntime-web/webgpu` entry point. That entry is compiled to load the **asyncify** WASM build, which is the only one that defines the native WebGPU bridge `webgpuInit`; the jsep build does not define it at all. Every WebGPU session therefore failed identically on every device and browser:
+
+```text
+WebGPU failed for <model> (no available backend found.
+ERR: [webgpu] TypeError: j(...).webgpuInit is not a function); using WASM instead.
+```
+
+Reproduced headlessly before the fix (Chromium 153, `--enable-unsafe-webgpu` with SwiftShader, secure-context page, dev server and production bundle, constant ONNX test doubles from `scripts/make_test_models.py` plus a generated H.264 clip): the page reported a working adapter while the exported session recorded `provider: WASM detector / WASM pool (1 worker × 2 threads) pose` with exactly the message above.
+
+After the fix (`src/core/ortRuntime.ts` pins each entry point to its matching WASM build, probes the adapter first, and passes it via `env.webgpu.adapter`):
+
+| Run (`scripts/gpu-analysis-check.mjs`) | Provider | ONNX Runtime assets actually fetched |
+| --- | --- | --- |
+| Adapter available | `WebGPU (google · swiftshader) detector / WebGPU (google · swiftshader) pose` | asyncify glue + asyncify wasm only |
+| `requestAdapter()` → null | `WASM detector / WASM pool (1 worker × 2 threads) pose` | plain glue + plain wasm only |
+| Force WASM | `WASM detector / WASM pool (1 worker × 2 threads) pose` | plain glue + plain wasm only |
+
+Both the dev server and the production bundle (`vite preview`) were exercised; the run completed with no page errors in every case, and the notes carry the precise reason when the GPU is not used ("handed out no adapter at all … check chrome://gpu", "a software adapter; GPU inference is optional", "Force WASM compatibility mode is on"). Automated checks for this update: 70 unit tests (10 new in `tests/ortRuntime.test.ts`, including the entry→WASM-module pairing re-derived from the installed package and the adapter-probe branches) and the 8 production browser tests.
+
+Added developer tooling (not shipped in the app bundle): `scripts/lib/chromium.mjs` launches a Chromium with the sandbox's bundled NSS/SwiftShader libraries (used by `smoke.mjs`, `worker-check.mjs`, `decode-check.mjs` and `gpu-analysis-check.mjs`), and `scripts/gpu-analysis-check.mjs` prints the provider, the session warnings, and every ONNX Runtime asset requested — the check that made this bug visible.
+
+**Still not validated:** real pretrained YOLOX/DWPose weights, real hardware GPUs and their drivers (this sandbox only offers a SwiftShader software adapter — accuracy and speed claims on real GPUs remain unmet), Safari and Firefox, GPU memory limits with 216 MB fp32 detector weights, and the mid-run device-loss recovery path (implemented, type-checked, and covered by design review only — no device-loss event was triggered in this environment).

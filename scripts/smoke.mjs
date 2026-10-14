@@ -1,10 +1,7 @@
 import { chromium } from "playwright";
-import chrome from "@sparticuz/chromium";
-const browser = await chromium.launch({
-  executablePath: await chrome.executablePath(),
-  args: chrome.args,
-  headless: true,
-});
+import { resolveChromium } from "./lib/chromium.mjs";
+const { executablePath, args, env } = await resolveChromium();
+const browser = await chromium.launch({ executablePath, args, env, headless: true });
 const page = await browser.newPage({ viewport: { width: 1440, height: 1050 } });
 const errors = [];
 page.on("pageerror", (e) => errors.push(e.message));

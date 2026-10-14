@@ -85,3 +85,25 @@ WebGPU failed on every browser/device combination the maintainer tried, and the 
 - **Cross-origin isolation on static hosting**: Vite sends COOP/COEP for dev/preview; `public/coi-serviceworker.js` adds the same headers on GitHub Pages after one reload, unlocking threaded WASM where the browser supports it. Without isolation the pool alone provides the speedup.
 
 Not changed: decode order, seat tracking, TTA fusion, metrics, and all accuracy gates. Speed on real weights still needs measuring on a maintainer machine (the build sandbox has 2 cores and only test-double models); per-session settings are recorded in each session's `provider` string for that comparison.
+
+## GPU fix update (2026-10-14)
+
+"WebGPU fails no matter which device or browser is used" turned out to be an application bug, not a hardware limitation: the analysis worker pinned `ort-wasm-simd-threaded.jsep.*` in `env.wasm.wasmPaths` while importing the `onnxruntime-web/webgpu` entry point, whose compiled-in WASM variant is `ort-wasm-simd-threaded.asyncify.*`. Only the asyncify/jspi builds define the native WebGPU bridge (`webgpuInit`) that the webgpu entry calls, so **every** WebGPU session creation threw `no available backend found. ERR: [webgpu] TypeError: ...webgpuInit is not a function` and the app fell back to CPU — identical on Windows, macOS, Linux, Chrome, Firefox and Safari.
+
+Fixed since the checkpoint above:
+
+- **`src/core/ortRuntime.ts`**: single place that pairs each ONNX Runtime entry point with the WASM build it was compiled against, plus a WebGPU adapter probe that distinguishes no API / no adapter / software-only adapter / specific error and explains each case in the session notes. A probed adapter is handed to ONNX Runtime via `env.webgpu.adapter`.
+- **WASM-only runs now load the small plain build** (~14 MB instead of ~27 MB and no asyncify overhead) because the variant is chosen after the adapter probe; pose workers import `onnxruntime-web/wasm` and never ship GPU code.
+- **Mid-run GPU loss is survivable**: a detector or pose session that fails during a run (device lost, driver reset, out-of-memory) is rebuilt on WASM — single-flight for concurrent TTA passes — and the run continues with a recorded warning instead of discarding decoded frames.
+- **Runtime visibility**: the workspace shows the provider string after a run (`WebGPU (google · swiftshader) detector / WebGPU pose`, or the WASM pool), and it is recorded in the session, CSV/PDF export and comparison validation.
+- **Regression coverage**: `tests/ortRuntime.test.ts` re-derives the entry→WASM-module table from the installed package (webgpu→asyncify, wasm→plain, only the pinned WebGPU build defines `webgpuInit`) and unit-tests the probe branches. `scripts/gpu-analysis-check.mjs` runs the real pipeline headlessly and prints the provider, warnings and the exact ONNX Runtime assets fetched.
+
+Verified in the build sandbox with `scripts/gpu-analysis-check.mjs` against the dev server and the production bundle, using constant ONNX test doubles and a generated H.264 clip (Chromium 153, SwiftShader as the only adapter):
+
+| Run | Result |
+| --- | --- |
+| Adapter available | `provider: WebGPU (google · swiftshader) detector / WebGPU (google · swiftshader) pose`; only the asyncify glue + wasm fetched; no WebGPU failure warnings |
+| No adapter (`requestAdapter()` → null) | `provider: WASM detector / WASM pool (1 worker × 2 threads) pose`; note explains the missing adapter and points at `chrome://gpu`; only the plain build fetched |
+| Force WASM | WASM pool; note records that WebGPU was skipped on request |
+
+Still not validated here: real pretrained weights, real hardware GPUs (the sandbox only has a software adapter), Safari/Firefox, and the mid-run device-loss path (implemented and type-checked, not triggered by a real device loss). See the validation report.
