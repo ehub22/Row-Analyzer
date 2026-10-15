@@ -565,6 +565,12 @@ export default function Viewer(p: Props) {
           <i className="manual" />
           Manually corrected
         </span>
+        {p.session?.boat.feetHidden === true && (
+          <span title="Feet are strapped to the stretcher below the gunwale, so ankle and foot keypoints would only be model guesses. They are not estimated; change this under Session setup → Feet in view.">
+            <i className="hidden-joint" />
+            Feet hidden by hull · not estimated
+          </span>
+        )}
         <small>
           {p.session
             ? "Exact decoded timestamps"

@@ -12,13 +12,23 @@ import { decodeYolo, decodeYolox } from "../core/detection";
 import { decodeSimCC, decodeHeatmap, unflip, fusePoses } from "../core/pose";
 import { SeatTracker } from "../core/tracking";
 import { checkDetectorContract, checkPoseContract } from "../core/compat";
-import { recoverOcclusion } from "../core/occlusion";
+import {
+  hiddenJoints,
+  recoverOcclusion,
+  suppressHiddenJoints,
+} from "../core/occlusion";
 import { segmentStrokes } from "../core/strokes";
 import { estimateCamera } from "../core/geometry";
 import { FrameSource, Rasterizer } from "../core/preprocess";
 import { SequentialPipeline } from "../core/queue";
 import { StageTimer, buildReport } from "../core/perf";
-import { assessPose, describeTta, passPlan, type PosePass } from "../core/tta";
+import {
+  assessPose,
+  describeTta,
+  gateJoints,
+  passPlan,
+  type PosePass,
+} from "../core/tta";
 import {
   planParallelism,
   readParallelEnv,
@@ -605,6 +615,16 @@ async function run(job: Job) {
     let posePasses = 0,
       posePassesSaved = 0;
 
+    // Joints this footage cannot show (feet strapped below the gunwale, per
+    // the session setup). Their model output is a guess: it is dropped before
+    // tracking, and it must not decide whether a crop pays for extra passes.
+    const hidden = hiddenJoints(job.boat);
+    const gate = gateJoints(hidden);
+    if (hidden.length)
+      notes.push(
+        "Feet hidden by the hull (session setup): ankle and foot keypoints are not estimated, because a pose model can only guess joints below the gunwale. Stroke timing uses hip and knee motion, and the adaptive TTA gate ignores the hidden joints.",
+      );
+
     /**
      * Runs a set of passes. Independent passes fan out across the pool; a local
      * session stays strictly sequential because every local pass rasterises
@@ -646,11 +666,12 @@ async function run(job: Job) {
       if (job.settings.tta === "adaptive") {
         const first = await posePass(source, passes[0].crop, passes[0].flip);
         posePasses++;
-        if (assessPose(first).accepted) {
+        if (assessPose(first, 0.5, 0.3, gate).accepted) {
           // Skipping the other passes is the whole point of the policy: the
-          // first pass already found every body joint at a usable confidence.
+          // first pass already found every body joint that can be visible at
+          // a usable confidence.
           posePassesSaved += passes.length - 1;
-          return { box, points: first };
+          return { box, points: suppressHiddenJoints(first, hidden) };
         }
         const rest = await runPasses(source, passes.slice(1));
         posePasses += rest.length;
@@ -661,7 +682,10 @@ async function run(job: Job) {
       }
       return {
         box,
-        points: await timer.timeAsync("fuse", async () => fusePoses(poses)),
+        points: suppressHiddenJoints(
+          await timer.timeAsync("fuse", async () => fusePoses(poses)),
+          hidden,
+        ),
       };
     };
 
@@ -864,7 +888,9 @@ async function run(job: Job) {
       height: meta.height,
       duration: meta.duration,
       timestamps: timestamps.sort((a, b) => a - b),
-      boat: job.boat,
+      // Explicit, so a reviewer (and the viewer legend) can tell whether this
+      // run discarded foot keypoints; older sessions simply lack the field.
+      boat: { ...job.boat, feetHidden: hidden.length > 0 },
       frames: recovered,
       strokes,
       performance: performance_,
@@ -885,7 +911,7 @@ async function run(job: Job) {
               "Cross-origin isolation is off: each WASM session runs single-threaded and parallelism comes from the pose-worker pool. Serving with COOP/COEP headers (on GitHub Pages the bundled isolation service worker does this after one reload) unlocks threaded WASM per session.",
             ]),
         "Experimental tracking: review seat identity and keypoints before coaching.",
-        "Catch/finish events are hip-to-ankle cycle proxies, not directly observed blade entry/release.",
+        "Catch/finish events are leg-compression proxies from thigh (hip-to-knee) elevation, not directly observed blade entry/release.",
         "3D camera normalization, oar tracking, and depth-dependent biomechanics are not validated and are withheld.",
       ],
       model: `${job.detector.name} + ${job.pose.name}; ${job.settings.width}×${job.settings.height}; ${describeTta(job.settings.tta)}`,

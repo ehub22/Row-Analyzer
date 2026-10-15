@@ -14,7 +14,8 @@ A private, offline rowing-video review workbench for desktop Chrome. **Research 
 - Browser ONNX Runtime Web pipeline: **WebGPU now actually runs.** The previous build pinned the wrong ONNX Runtime WASM module for the WebGPU entry point, so every GPU session failed on every device and browser with `webgpuInit is not a function` and silently fell back to CPU. The runtime now pins the WASM build each entry point was compiled against, probes the adapter before touching a model, and hands the probed adapter to ONNX Runtime. Every WebGPU session still has to pass a warm-up inference before decoding starts, and when the GPU is unavailable (or dies mid-run: device lost, driver reset) the analysis continues on the **parallel WASM pose-worker pool** with the exact reason recorded — no silent fallback. The workspace and every export show which runtime ran, e.g. `WebGPU (apple · metal-3) detector / WebGPU pose`. Threaded WASM additionally activates when the page is cross-origin isolated (COOP/COEP; the bundled service worker enables this on GitHub Pages). **Requires separately imported authentic detector and whole-body model weights.**
 - Top-down YOLOX / YOLOv8/11 detector adapters, aspect-correct padded crops, 133-joint SimCC or heatmap pose adapters, sub-pixel decoding, four-pass flip/multi-scale coordinate fusion.
 - Global seat assignment with ambiguity gates; short bidirectional gap filling; observed/inferred/manual/missing provenance; low-confidence jump rejection.
-- Per-seat and crew review; catch/finish **body-motion proxies**, stroke rate, drive-to-recovery ratio, crew timing in milliseconds and phase degrees.
+- Per-seat and crew review; catch/finish **body-motion proxies** from thigh (hip-to-knee) elevation, stroke rate, drive-to-recovery ratio, crew timing in milliseconds and phase degrees.
+- **Hidden feet are handled as expected occlusion.** On the water the feet are strapped to the stretcher below the gunwale, so a whole-body model can only guess them. With *Feet in view: Hidden by the hull* (the default) those guesses are discarded instead of tracked: stroke cycles are timed from hips and knees, which stay above the gunwale; the adaptive TTA gate stops paying four passes per crop for joints no pass can reveal; and when the knees also drop behind the hull with the legs flat, the cycle is bridged rather than lost. Choose *Visible* for ergometer or overhead footage.
 - Manual keypoint corrections with local refit, partial COCO-style training labels, JSON sessions, CSV tables, PDF reports.
 - Saved-session timing comparison. Explicitly labeled synthetic demonstration.
 
@@ -75,7 +76,9 @@ Levers, roughly in order of effect:
    inferences. Adaptive (the default) runs one pass first and only pays for the
    rest where a body joint came back below 0.3 — on clean footage that is the
    single biggest saving available, and where a crop *is* weak the same four
-   passes fuse exactly as under *Always*.
+   passes fuse exactly as under *Always*. Joints the session declares hidden
+   (the ankles, on the water) do not count: before that, a guessed ankle made
+   nearly every on-water crop pay all four passes.
 2. **Pose workers and cross-origin isolation.** The pool is how CPU inference
    scales; threaded WASM per session additionally needs COOP/COEP (the bundled
    service worker enables it on Pages after one reload). The settings dialog
@@ -129,11 +132,11 @@ equivalence check and times each stage on your own machine.
 | `src/core/pose.ts` | whole-body SimCC/heatmap decoding, mirror mapping, TTA fusion |
 | `src/core/tracking.ts` | stable seat slots, global assignment, ambiguity abstention |
 | `src/core/geometry.ts` | calibrated 3D transforms, scale utility, camera abstention |
-| `src/core/occlusion.ts` | short-gap recovery, jump rejection, manual refit |
-| `src/core/strokes.ts` | body-motion cycle proxies, evidence gating, crew synchronization |
+| `src/core/occlusion.ts` | expected occlusion (feet hidden by the hull), short-gap recovery, jump rejection, manual refit |
+| `src/core/strokes.ts` | thigh-elevation cycle proxies (hips and knees only), hull-trough bridging, evidence gating, crew synchronization |
 | `src/core/export.ts` | sessions, partial training labels, CSV and PDF |
 | `src/core/preprocess.ts` | frame → model tensor rasterisation: one bitmap per frame, reused canvas/buffer |
-| `src/core/tta.ts` | test-time-augmentation policy and the adaptive pass gate |
+| `src/core/tta.ts` | test-time-augmentation policy and the adaptive pass gate (ignores joints hidden for the session) |
 | `src/core/queue.ts` | bounded, in-order stage pipeline (detector and pose overlap) |
 | `src/core/perf.ts` | per-stage timing and the run's performance summary |
 | `src/core/parallel.ts` / `src/core/pool.ts` | worker-pool + WASM-thread planning; least-busy pose job dispatch with failover |

@@ -85,11 +85,55 @@ Implemented a parallel WASM pose-worker pool, threaded-WASM planning, a WebGPU w
 - The sandbox browser reproduces the maintainer's WebGPU failure (`Failed to get GPU adapter`): both models now record the precise reason in session warnings and analysis completes on the WASM pool instead of relying on session-creation fallback alone.
 - **Not measured:** wall-clock speedup with real DWPose/YOLOX weights (sandbox has 2 cores and no trained models; pool-vs-single timing there is oversubscription-bound and not representative), threaded-WASM engagement under a genuinely cross-origin-isolated desktop page, Safari/Firefox worker-pool behavior, and long-clip memory with 4 × ~134 MB pose sessions. Verify on a maintainer machine via the `provider` string and per-run timing before quoting any speedup factor.
 
+## Hidden-feet update — simulation checks (2026-10-15)
+
+On-water side views hide the feet (strapped to the stretcher below the gunwale) for the whole clip, and whole-body models answer for them anyway. This update discards those answers, times stroke cycles from hips and knees, and leaves hidden joints out of the adaptive TTA gate (see the roadmap's *Hidden-feet update*).
+
+**Everything below comes from a synthetic simulator, not from footage or trained weights.** `tests/fixtures/rowingSim.ts` generates what a pose model plausibly returns for a rower filmed from a launch:
+- a two-link leg with the ankle fixed on the stretcher and the hip on a horizontal slide; knee angle 50° at the catch, 175° with the legs flat (28–55% of the cycle); trunk swing and arm draw in sequence;
+- 300 px/m, keypoint noise σ = 1.2% of the box height, 0.3 m launch drift, 0.08 m stroke-locked boat surge, 3% per-frame knee dropouts;
+- three behaviours for the hidden feet: **guessed** (a drifting shin extrapolated from the knee that sometimes latches onto the handle; confidence 0.1–0.62, so ~60% of guesses read as "observed"), **dropped** (confidence 0.02–0.32) and **visible** (erg footage);
+- optionally, **knees behind the hull**: a saxboard at hip height hides the knee whenever the legs are nearly flat (46% of every cycle), and the model drops it every time.
+
+The simulator encodes assumptions about how a model fails, so it pins the pipeline's behaviour on those failures; it does not measure accuracy on real rowing. Each row: 5 seeds × 40 s at 30 fps. "Catch" is maximum leg compression in the simulation, not blade entry. Reproduce the new-pipeline table with `ROW_SIM_REPORT=1 npx vitest run tests/feet.test.ts`; the old rows ran `git show 1ec983a:src/core/strokes.ts` on the same simulator.
+
+Before (hip-to-ankle segmentation, ankles as evidence):
+
+| Feet in the model output | True rate (spm) | Cycles in clip | Strokes reported | Mean reported rate | Worst stroke error |
+| --- | --- | --- | --- | --- | --- |
+| visible | 18 / 20 | 55 / 65 | 114 / 127 | 36.6 / 40.1 | 32 / 29 spm |
+| visible | 26 / 32 / 40 | 85 / 105 / 130 | 85 / 105 / 130 | 26.0 / 32.0 / 40.0 | ≤ 0.9 spm |
+| guessed | 18 / 20 / 26 / 32 / 40 | 55 / 65 / 85 / 105 / 130 | 82 / 84 / 84 / 87 / 88 | 32.0 / 31.1 / 30.7 / 31.1 / 32.4 | 18–31 spm |
+| dropped | 18–40 | 55–130 | 0 (17–24 found, all withheld) | — | — |
+
+Guessed ankles produced a rate of about 31 spm whatever the crew rowed, reported as valid. Visible feet doubled the rate at ≤ 20 spm (plateau noise on the legs-flat phase; the 1.2 s merge window of PR #7 only hid it at higher rates).
+
+After (thigh elevation, hips and knees only). Guessed, dropped and visible feet give **identical** results, because the segmentation never reads them:
+
+| True rate (spm) | Cycles in clip | Cycles found | Mean rate | Worst stroke error | Catch timing (mean, worst) | Finish phase |
+| --- | --- | --- | --- | --- | --- | --- |
+| 18 | 55 | 50 | 18.00 | 0.37 spm | −99 ms, 133 ms | 0.44–0.48 |
+| 20 | 65 | 60 | 19.99 | 0.45 spm | −93 ms, 133 ms | 0.44–0.48 |
+| 26 | 85 | 85 | 25.99 | 0.65 spm | −71 ms, 108 ms | 0.44–0.48 |
+| 32 | 105 | 100 | 32.01 | 1.33 spm | −57 ms, 100 ms | 0.44–0.48 |
+| 40 | 130 | 130 | 40.02 | 0.91 spm | −48 ms, 67 ms | 0.42–0.49 |
+
+With the knees also behind the hull while the legs are flat: 50 / 61 / 85 / 102 / 130 cycles found at the same rates, mean rate within 0.02 spm, worst stroke 0.37–1.33 spm, catch timing −43 to −87 ms (worst 133 ms), finish phase 0.44–0.49. Without the hull-trough bridge this scenario found **no cycles at all**.
+
+- Every cycle found is within 0.25 s of a true catch; none is spurious. The cycles not found are those whose catch band is cut off by the start or end of the clip.
+- The catch proxy is early by a consistent 40–100 ms (the middle of a broad peak, as designed). Stroke rate is unaffected, and crew timing compares seats with the same bias.
+- TTA gate, share of crops sent to four passes: 7% with the gate that skips hidden joints, for every feet behaviour; the previous gate sent 7% (visible), 64% (guessed) and 100% (dropped). With the knees behind the hull it is about 50% (old gate 81%), because a knee hidden in a frame is a genuinely weak body joint.
+- Regression tests (`tests/feet.test.ts`) pin these behaviours: rate and timing at 18–40 spm, no doubling at low rates, invariance to whatever the feet joints contain, no cycle across a blind spot, no bridge across a blind spot that could hide a catch, withholding when hips and knees are only inferred, and the session field, demo and import validation.
+
+Automated checks run for this update: 125 unit tests (plus the opt-in simulation report) and the 8 production browser tests.
+
+**Not validated:** behaviour on real footage with real weights; whether a real model guesses or drops hidden feet (both are handled); the thigh-elevation catch and finish against observed blade entry and release; knee visibility in a given boat and camera position.
+
 ## Remaining release gates
 
 1. Retrieve licensed reference detector + whole-body weights, verify hashes/contracts and test GPU/WASM agreement on actual pixels.
 2. Annotate visible joints, hands, feet and seat IDs across complete strokes of both sweep/scull samples. Record occluded joints as such.
-3. Measure per-joint normalized pixel/PCK/OKS errors, identity switches, time-to-reacquire, long-gap behavior, TTA benefit and catch/finish error against observed blade entry/release.
+3. Measure per-joint normalized pixel/PCK/OKS errors, identity switches, time-to-reacquire, long-gap behavior, TTA benefit and catch/finish error against observed blade entry/release. Check the thigh-elevation cycle timing (and hull-trough bridging) on labelled on-water clips; it is so far validated only in simulation.
 4. Extend the synthetic masking suite to real held-out annotations at increasing gap lengths and crossing/overlap conditions.
 5. Implement and validate boat motion compensation, hull/rigger/oar cues, camera intrinsics/azimuth and temporal 3D lifting against calibrated multi-view ground truth.
 6. Add observed handle/stretcher/oar constraints, cyclic templates, bone-length checks, bidirectional filtering, angle reliability tests and sequencing diagnoses.

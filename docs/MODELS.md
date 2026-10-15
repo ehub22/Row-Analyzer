@@ -43,6 +43,11 @@ The app imports local `.onnx` files; it does not execute Python or send video to
 ### TTA
 Two crop scales (1.25, 1.5) × original/flipped input. Preserve aspect ratio and swap all body, foot, facial, and hand mirror indices. Keep per-joint provenance and confidence. Padded crops extend beyond the image with black padding. Per-frame detection plus per-person four-pass pose inference is deliberately slow.
 
+The *Adaptive* policy (default) runs the first pass alone and accepts it when every gated body joint reaches 0.3 and the body mean reaches 0.5; otherwise the same four passes run and fuse. Joints the session declares hidden are not gated: with *Feet in view: Hidden by the hull* (the on-water default) that is the ankles, which no extra pass can reveal.
+
+### Hidden feet
+On the water the feet (ankles 15–16, feet 17–22) are below the gunwale for the whole clip, so whatever the model returns for them is a guess. When the session declares them hidden, the worker replaces them with missing joints flagged *Feet hidden by the hull* before tracking, and stroke cycles use hips and knees only. A manually placed foot point is kept. Choose *Visible* for ergometer or overhead footage to track them like any other joint.
+
 ## Automatic download and cache
 
 Weights are **never** committed to Git or bundled in the Pages build (`*.onnx` is ignored; `dist/` contains only the app). Instead, the app loads each model in this order:
