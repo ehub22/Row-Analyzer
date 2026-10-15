@@ -19,14 +19,36 @@
 
 import type { Box, Point } from "./types";
 
-export interface PoseJob {
-  /** CHW float tensor for one crop/TTA pass (transferred, not cloned). */
-  data: Float32Array;
-  dims: readonly [number, number, number, number];
+interface PoseJobBase {
   crop: Box;
   flip: boolean;
   format: "simcc" | "heatmap";
 }
+
+/**
+ * One crop/TTA pass, either already rasterised by the coordinator
+ * (`data`, transferred) or handed over as a frame bitmap that the worker
+ * rasterises itself.
+ *
+ * The bitmap form exists because rasterising a crop is expensive and was
+ * previously done serially on the coordinator while every pooled worker sat
+ * idle: profiling a 288×384 pose crop showed ~20 ms to draw a VideoFrame and
+ * ~9 ms to draw the frame's shared ImageBitmap, against sub-millisecond pose
+ * postprocessing. Sending the bitmap moves that cost into the pool, where it
+ * runs in parallel and off the coordinator's critical path.
+ */
+export interface TensorPoseJob extends PoseJobBase {
+  data: Float32Array;
+  dims: readonly [number, number, number, number];
+}
+
+export interface BitmapPoseJob extends PoseJobBase {
+  /** Frame bitmap; serialized per worker unless `transfer` is set. */
+  bitmap: ImageBitmap;
+  transfer: boolean;
+}
+
+export type PoseJob = TensorPoseJob | BitmapPoseJob;
 
 export interface PoolEndpoint {
   /** Sends a message, optionally transferring ownership of buffers. */
@@ -39,6 +61,22 @@ interface Pending {
   reject: (error: Error) => void;
 }
 
+/** Per-pass milliseconds measured inside a pose worker. */
+export interface PassTimings {
+  preprocess?: number;
+  infer?: number;
+  decode?: number;
+}
+
+export interface PoseWorkerPoolOptions {
+  /**
+   * Called for every completed pass with the worker's own timing breakdown.
+   * Workers sum these independently, so the caller reports per-pass averages
+   * rather than a share of wall time.
+   */
+  onPassTimings?: (timings: PassTimings) => void;
+}
+
 interface EndpointState {
   ready: boolean;
   dead: boolean;
@@ -47,6 +85,13 @@ interface EndpointState {
 
 const toError = (v: unknown): Error =>
   v instanceof Error ? v : new Error(typeof v === "string" ? v : String(v));
+
+/** Chrome's list of transferable types, checked without assuming ImageBitmap. */
+function isTransferable(value: unknown): value is Transferable {
+  return (
+    typeof ImageBitmap !== "undefined" && value instanceof ImageBitmap
+  );
+}
 
 export class PoseWorkerPool {
   private endpoints: PoolEndpoint[];
@@ -59,11 +104,13 @@ export class PoseWorkerPool {
     resolve: () => void;
     reject: (e: Error) => void;
   }[] = [];
+  private onPassTimings?: (timings: PassTimings) => void;
 
-  constructor(endpoints: PoolEndpoint[]) {
+  constructor(endpoints: PoolEndpoint[], options: PoseWorkerPoolOptions = {}) {
     this.endpoints = endpoints;
     this.state = endpoints.map(() => ({ ready: false, dead: false }));
     this.inflight = endpoints.map(() => 0);
+    this.onPassTimings = options.onPassTimings;
   }
 
   get size(): number {
@@ -128,21 +175,36 @@ export class PoseWorkerPool {
     return new Promise<Point[]>((resolve, reject) => {
       this.pending.set(id, { endpoint: target, resolve, reject });
       this.inflight[target]++;
-      try {
-        this.endpoints[target].send(
-          {
+      const bitmapJob = "bitmap" in job ? job : null;
+      const message = bitmapJob
+        ? {
             type: "pose",
             id,
-            data: job.data,
-            dims: [...job.dims],
+            bitmap: bitmapJob.bitmap,
             crop: job.crop,
             flip: job.flip,
             format: job.format,
-          },
-          // Transfer the tensor backing store: zero-copy, and the caller
-          // must build a fresh tensor per concurrent pass anyway.
-          [job.data.buffer as ArrayBuffer],
-        );
+          }
+        : {
+            type: "pose",
+            id,
+            data: (job as TensorPoseJob).data,
+            dims: [...(job as TensorPoseJob).dims],
+            crop: job.crop,
+            flip: job.flip,
+            format: job.format,
+          };
+      // A bitmap is serialized as a lightweight handle to the same pixels, so
+      // the coordinator keeps its own handle and every worker gets a reference
+      // instead of a pixel copy. A tensor buffer is transferred: zero-copy, and
+      // the caller must build a fresh tensor per concurrent pass anyway.
+      const transfer: Transferable[] = bitmapJob
+        ? bitmapJob.transfer && isTransferable(bitmapJob.bitmap)
+          ? [bitmapJob.bitmap]
+          : []
+        : [(job as TensorPoseJob).data.buffer as ArrayBuffer];
+      try {
+        this.endpoints[target].send(message, transfer);
       } catch (e) {
         this.pending.delete(id);
         this.inflight[target]--;
@@ -159,6 +221,7 @@ export class PoseWorkerPool {
       type?: string;
       id?: number;
       points?: Point[];
+      timings?: PassTimings;
       error?: unknown;
     };
     if (msg.type === "ready") {
@@ -179,8 +242,10 @@ export class PoseWorkerPool {
       if (!p || p.endpoint !== index) return;
       this.pending.delete(msg.id!);
       this.inflight[index]--;
-      if (msg.type === "pose-result") p.resolve(msg.points ?? []);
-      else p.reject(toError(msg.error));
+      if (msg.type === "pose-result") {
+        if (msg.timings) this.onPassTimings?.(msg.timings);
+        p.resolve(msg.points ?? []);
+      } else p.reject(toError(msg.error));
     }
   }
 

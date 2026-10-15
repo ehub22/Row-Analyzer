@@ -43,7 +43,7 @@ npm run test:e2e       # production-browser workflow tests
 ## Use
 
 1. Import a short MP4/MOV clip (up to 300 MB, 20,000 decoded-frame guard). Choose the shell, rigging, seat count, best-visible seat, and bow direction in the image.
-2. Open **Models & settings**. When the build has model URLs configured, the detector and whole-body models download automatically on the first analysis (with progress) and are cached in this browser. Otherwise import compatible ONNX files from your device. Set input dimensions/format to match the export. Enable flip/multi-scale TTA for four passes per crop. **Parallel pose workers** controls how many CPU workers share those passes (Auto is right for most machines; each extra worker loads another copy of the pose model).
+2. Open **Models & settings**. When the build has model URLs configured, the detector and whole-body models download automatically on the first analysis (with progress) and are cached in this browser. Otherwise import compatible ONNX files from your device. Set input dimensions/format to match the export. **Test-time augmentation** chooses how many whole-body inferences one crop gets: *Adaptive* (default) runs the single pass first and spends the other three — second scale plus both flips — only where that pass left a body joint below 0.3, *Always* pays four passes on every crop, *Off* pays one. **Parallel pose workers** controls how many CPU workers share those passes (Auto is right for most machines; each extra worker loads another copy of the pose model).
 3. If needed, use the detection-region percentage bounds to exclude bystanders/coxswain detection centers. This is a static region; the crew must stay inside it.
 4. Analyze. All decoded frames are submitted. Initialization stops if detected people do not match configured seats, rather than silently assigning incorrect identities.
 5. Verify identity, observations, and occlusion. Use **Keyframe labels** to correct only visible joints. Select a joint and click to add a missing observation, or drag an existing point.
@@ -51,6 +51,74 @@ npm run test:e2e       # production-browser workflow tests
 7. Open **Compare** and import another exported JSON session. Current comparison is aggregate timing, not normalized 3D technique.
 
 The synthetic demo works without model downloads and is always marked as synthetic in the UI and exports.
+
+## Speed: where the time goes, and what to turn
+
+Every run now measures itself. The workspace's *Analysis notes* start with a
+performance line (also stored in exported sessions as `performance`), for
+example:
+
+```
+18.4 s for 1200 frames (65.2 fps) · pose 71% · detector 22% · track 1% ·
+decode wait 5% · pose.infer 84.1 ms/pass · pose.preprocess 2.3 ms/pass ·
+detector.preprocess 6.1 ms/pass · 2400 pose passes, 7200 skipped by adaptive TTA
+```
+
+Shares are of wall time, so `pose` and `detector` can add up past 100%: with a
+worker pool the two stages run at the same time. `ms/pass` figures are measured
+per pass (in the pose workers for `pose.*`), which is what tells inference apart
+from preprocessing.
+
+Levers, roughly in order of effect:
+
+1. **Test-time augmentation.** Four passes per crop is four whole-body
+   inferences. Adaptive (the default) runs one pass first and only pays for the
+   rest where a body joint came back below 0.3 — on clean footage that is the
+   single biggest saving available, and where a crop *is* weak the same four
+   passes fuse exactly as under *Always*.
+2. **Pose workers and cross-origin isolation.** The pool is how CPU inference
+   scales; threaded WASM per session additionally needs COOP/COEP (the bundled
+   service worker enables it on Pages after one reload). The settings dialog
+   shows the exact plan for the machine it is running on.
+3. **Input resolution and model size.** Cost is roughly quadratic in the model
+   input, so a whole-body export at 256×192 costs about a third of one at
+   384×288, and a medium checkpoint costs a fraction of a large one. The
+   settings must match the export exactly, and the contract check fails fast if
+   they do not.
+4. **The detector, when the report says so.** On CPU-only machines the detector
+   often dominates: it runs once per frame at its own resolution, and a
+   `yolox_tiny`/`yolov8n` export can be several times cheaper than the large
+   ones. Running the detector on a cadence and posing from tracked boxes is
+   *not* implemented — it changes what identity confidence means, and that is a
+   roadmap item, not a hidden setting.
+5. **Fewer pixels of crew.** The detection-region bounds and the boat's seat
+   count decide how many crops exist at all; a single scull is one crop per
+   frame, an eight is eight.
+
+Fixed costs are worth knowing too: creating ONNX sessions and starting the pool
+takes seconds regardless of clip length, so very short clips are dominated by
+startup — the performance line reports only the analysis itself.
+
+Two implementation choices are what made the pose stage cheap, and both are
+verified rather than assumed:
+
+- **One bitmap per frame.** Drawing a decoded `VideoFrame` into a canvas costs a
+  readback that does not shrink with the crop (measured at 288×384:
+  ~23 ms per pass against ~7 ms from the frame's shared `ImageBitmap`, on a
+  2-core container with a software rasteriser). The frame is converted once and
+  every crop, TTA pass and preview draws from it — and `scripts/pose-perf-check.mjs`
+  asserts the tensors are *bit-identical* to the old per-pass path, so this
+  changes speed only, never what the model sees.
+- **Crops are rasterised in the workers.** Each pose worker draws and normalises
+  its own crop from that bitmap into a reused buffer. Previously rasterisation
+  happened serially on the coordinator while every pooled worker waited for
+  work; now it is parallel, off the critical path, and allocates nothing per
+  pass. The same pipeline overlaps the next frame's detection with the current
+  frame's pose work, because the detector session and the pool are different
+  hardware.
+
+`node scripts/pose-perf-check.mjs` (against `npm run dev`) re-runs the
+equivalence check and times each stage on your own machine.
 
 ## Modules
 
@@ -64,6 +132,10 @@ The synthetic demo works without model downloads and is always marked as synthet
 | `src/core/occlusion.ts` | short-gap recovery, jump rejection, manual refit |
 | `src/core/strokes.ts` | body-motion cycle proxies, evidence gating, crew synchronization |
 | `src/core/export.ts` | sessions, partial training labels, CSV and PDF |
+| `src/core/preprocess.ts` | frame → model tensor rasterisation: one bitmap per frame, reused canvas/buffer |
+| `src/core/tta.ts` | test-time-augmentation policy and the adaptive pass gate |
+| `src/core/queue.ts` | bounded, in-order stage pipeline (detector and pose overlap) |
+| `src/core/perf.ts` | per-stage timing and the run's performance summary |
 | `src/core/parallel.ts` / `src/core/pool.ts` | worker-pool + WASM-thread planning; least-busy pose job dispatch with failover |
 | `src/workers/analysis.worker.ts` | ONNX sessions and offline pipeline orchestration |
 | `src/workers/pose.worker.ts` | one pooled pose-inference session (×N, connected by MessageChannel) |

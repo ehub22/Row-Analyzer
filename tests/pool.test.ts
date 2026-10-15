@@ -1,5 +1,10 @@
 import { describe, it, expect } from "vitest";
-import { PoseWorkerPool, type PoseJob } from "../src/core/pool";
+import {
+  PoseWorkerPool,
+  type BitmapPoseJob,
+  type PassTimings,
+  type PoseJob,
+} from "../src/core/pool";
 import type { Point } from "../src/core/types";
 
 interface Sent {
@@ -137,6 +142,50 @@ describe("PoseWorkerPool", () => {
       points: points(6),
     });
     await expect(c).resolves.toEqual(points(6));
+  });
+
+  it("sends a bitmap job as a lightweight clone, not a transferred handle", async () => {
+    // The coordinator keeps its bitmap so every other pass of the same frame
+    // can use it too; posting it without a transfer list serializes a handle.
+    const { pool, endpoints } = readyPool(1);
+    const bitmap = { width: 640, height: 360, close() {} } as unknown as ImageBitmap;
+    const job: BitmapPoseJob = {
+      bitmap,
+      transfer: false,
+      crop: { x: 0, y: 0, width: 10, height: 10, confidence: 1 },
+      flip: false,
+      format: "simcc",
+    };
+    const p = pool.dispatch(job);
+    const sent = endpoints[0].jobs[0];
+    expect(sent.message.bitmap).toBe(bitmap);
+    expect(sent.message.data).toBeUndefined();
+    expect(sent.transfer).toEqual([]);
+    pool.handleMessage(0, {
+      type: "pose-result",
+      id: sent.message.id,
+      points: points(0),
+    });
+    await p;
+  });
+
+  it("reports worker-side pass timings without changing the job result", async () => {
+    const seen: PassTimings[] = [];
+    const endpoints = [new FakeEndpoint()];
+    const pool = new PoseWorkerPool(endpoints, {
+      onPassTimings: (t) => seen.push(t),
+    });
+    pool.init({});
+    pool.handleMessage(0, { type: "ready" });
+    const p = pool.dispatch(job());
+    pool.handleMessage(0, {
+      type: "pose-result",
+      id: endpoints[0].jobs[0].message.id,
+      points: points(4),
+      timings: { preprocess: 1.2, infer: 30.5, decode: 0.4 },
+    });
+    await expect(p).resolves.toEqual(points(4));
+    expect(seen).toEqual([{ preprocess: 1.2, infer: 30.5, decode: 0.4 }]);
   });
 
   it("dispose rejects pending jobs", async () => {

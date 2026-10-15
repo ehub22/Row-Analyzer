@@ -1,3 +1,6 @@
+import type { TtaMode } from "./tta";
+import type { PerformanceReport } from "./perf";
+
 /** Latest processed frame only; bitmap ownership stays with the UI coordinator. */
 export interface LivePreview {
   bitmap: ImageBitmap;
@@ -90,13 +93,18 @@ export interface Session {
   warnings: string[];
   model: string;
   provider: string;
+  /** Where the run's time went (see core/perf.ts); absent on imports from
+   * builds that predate it. */
+  performance?: PerformanceReport;
 }
 export interface ModelSettings {
   detector: "yolox" | "yolo";
   format: "simcc" | "heatmap";
   width: number;
   height: number;
-  tta: boolean;
+  /** Test-time augmentation policy: one pass, a cascaded adaptive plan, or
+   * the full four-pass fusion (see core/tta.ts). */
+  tta: TtaMode;
   wasm: boolean;
   /** Parallel pose workers. 0 = automatic (see core/parallel.ts); 1–8 = fixed.
    * Each worker owns its own pose-model session, so more workers use more RAM. */
@@ -108,7 +116,7 @@ export const defaultModels: ModelSettings = {
   format: "simcc",
   width: 288,
   height: 384,
-  tta: true,
+  tta: "adaptive",
   wasm: false,
   workers: 0,
   region: { left: 0, top: 0, right: 100, bottom: 100 },

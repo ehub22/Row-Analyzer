@@ -33,6 +33,7 @@ import {
   RotateCcw,
   Focus,
   ExternalLink,
+  Gauge,
 } from "lucide-react";
 import Viewer, { framesAt } from "./components/Viewer";
 import { MotionChart, CrewChart } from "./components/Charts";
@@ -75,6 +76,7 @@ import {
   readParallelEnv,
   summarizePlan,
 } from "./core/parallel";
+import { describeTta } from "./core/tta";
 const tabs = ["Overview", "Crew timing", "Compare", "Keyframe labels"];
 const metricNames = [
   "Catch shin angle",
@@ -753,6 +755,11 @@ function App() {
                 <AlertTriangle size={15} /> Analysis notes · experimental
                 evidence <ChevronDown size={14} />
               </summary>
+              {session.performance && (
+                <p className="note performance-line">
+                  <Gauge size={14} /> {session.performance.summary}
+                </p>
+              )}
               <ul>
                 {session.warnings.map((w, i) => (
                   <li key={i}>{w}</li>
@@ -1080,9 +1087,7 @@ function App() {
                           : "Models download on first analysis"}
                       </strong>
                       <small>
-                        {settings.tta
-                          ? "133 joints · flip + multi-scale"
-                          : "133 joints · single pass"}
+                        {`133 joints · ${describeTta(settings.tta)}`}
                       </small>
                     </span>
                     <ChevronRight size={15} />
@@ -1765,23 +1770,37 @@ function App() {
                     )}
                   </div>
                 </details>
-                <label className="check-label">
-                  <input
-                    type="checkbox"
-                    checked={settings.tta}
+                <label>
+                  Test-time augmentation
+                  <select
+                    aria-label="Test-time augmentation"
+                    value={settings.tta}
                     onChange={(e) =>
-                      setSettings({ ...settings, tta: e.target.checked })
+                      setSettings({
+                        ...settings,
+                        tta: e.target.value as ModelSettings["tta"],
+                      })
                     }
-                  />
-                  <span>
-                    <strong>Flip + multi-scale test-time augmentation</strong>
-                    <small>
-                      Four passes per crop, distributed across the pose workers.
-                      Slower processing; preserves confidence and flags
-                      disagreement.
-                    </small>
-                  </span>
+                  >
+                    <option value="off">Off · one pass per crop</option>
+                    <option value="adaptive">
+                      Adaptive · extra passes only when the first is weak
+                    </option>
+                    <option value="always">
+                      Always · four passes per crop
+                    </option>
+                  </select>
                 </label>
+                <p className="note">
+                  Pose inference is the slow part of a run, and each pass of a
+                  crop is a full whole-body inference. <strong>Adaptive</strong>{" "}
+                  runs the single pass first and spends the other three (second
+                  scale + both flips) only where that pass left a body joint
+                  below 0.3 — the same four passes fuse exactly as in Always.{" "}
+                  <strong>Always</strong> pays four passes on every crop;{" "}
+                  <strong>Off</strong> pays one and reports no disagreement
+                  flag. Crops are always distributed across the pose workers.
+                </p>
                 <label className="check-label">
                   <input
                     type="checkbox"

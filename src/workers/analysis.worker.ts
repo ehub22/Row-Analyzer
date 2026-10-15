@@ -8,13 +8,17 @@ import {
   type GpuProbe,
 } from "../core/ortRuntime";
 import { decodeVideo } from "../core/video";
-import { decodeYolo, decodeYolox, paddedCrop } from "../core/detection";
+import { decodeYolo, decodeYolox } from "../core/detection";
 import { decodeSimCC, decodeHeatmap, unflip, fusePoses } from "../core/pose";
 import { SeatTracker } from "../core/tracking";
 import { checkDetectorContract, checkPoseContract } from "../core/compat";
 import { recoverOcclusion } from "../core/occlusion";
 import { segmentStrokes } from "../core/strokes";
 import { estimateCamera } from "../core/geometry";
+import { FrameSource, Rasterizer } from "../core/preprocess";
+import { SequentialPipeline } from "../core/queue";
+import { StageTimer, buildReport } from "../core/perf";
+import { assessPose, describeTta, passPlan, type PosePass } from "../core/tta";
 import {
   planParallelism,
   readParallelEnv,
@@ -52,6 +56,9 @@ const poolPorts: MessagePort[] = [];
 // The pool of the currently running job, so transport-level worker errors
 // relayed by the main thread ("pool-error") can mark endpoints dead.
 let activePool: PoseWorkerPool | null = null;
+// Stage timer of the current run: pose workers are created before the run
+// starts, so their reported pass timings land here once it does.
+let timerRef: StageTimer | null = null;
 
 interface LoadedModel {
   session: ort.InferenceSession;
@@ -131,67 +138,10 @@ function probeDimsFrom(
   );
 }
 
-const canvas = new OffscreenCanvas(640, 640);
-const ctx = canvas.getContext("2d", { willReadFrequently: true })!;
-const POSE_MEAN = [123.675, 116.28, 103.53];
-const POSE_STD = [58.395, 57.12, 57.375];
-function tensor(
-  frame: VideoFrame,
-  w: number,
-  h: number,
-  crop: Box | null,
-  flip: boolean,
-  mode: "yolo" | "yolox" | "pose",
-) {
-  canvas.width = w;
-  canvas.height = h;
-  ctx.fillStyle = mode === "pose" ? "black" : "rgb(114,114,114)";
-  ctx.fillRect(0, 0, w, h);
-  ctx.save();
-  if (flip) {
-    ctx.translate(w, 0);
-    ctx.scale(-1, 1);
-  }
-  if (crop) {
-    ctx.drawImage(frame, crop.x, crop.y, crop.width, crop.height, 0, 0, w, h);
-  } else {
-    const ratio = Math.min(w / frame.displayWidth, h / frame.displayHeight);
-    ctx.drawImage(
-      frame,
-      0,
-      0,
-      frame.displayWidth * ratio,
-      frame.displayHeight * ratio,
-    );
-  }
-  ctx.restore();
-  const pixels = ctx.getImageData(0, 0, w, h).data,
-    plane = w * h,
-    data = new Float32Array(3 * plane);
-  // Channel-major loops with the mode branch hoisted out: this runs once per
-  // crop/TTA pass (up to 32× per frame), so per-pixel branching added up.
-  if (mode === "pose") {
-    for (let c = 0; c < 3; c++) {
-      const off = c * plane,
-        mean = POSE_MEAN[c],
-        inv = 1 / POSE_STD[c];
-      for (let i = 0; i < plane; i++)
-        data[off + i] = (pixels[i * 4 + c] - mean) * inv;
-    }
-  } else if (mode === "yolox") {
-    for (let c = 0; c < 3; c++) {
-      const off = c * plane,
-        src = 2 - c; // BGR
-      for (let i = 0; i < plane; i++) data[off + i] = pixels[i * 4 + src];
-    }
-  } else {
-    for (let c = 0; c < 3; c++) {
-      const off = c * plane;
-      for (let i = 0; i < plane; i++) data[off + i] = pixels[i * 4 + c] / 255;
-    }
-  }
-  return new ort.Tensor("float32", data, [1, 3, h, w]);
-}
+// Rasterisation lives in core/preprocess.ts: frames are converted to one
+// ImageBitmap (core/preprocess.ts explains why that is many times cheaper than
+// drawing the VideoFrame per pass, with identical pixels) and each model input
+// shape keeps one reusable canvas + tensor buffer here.
 
 async function infer(session: ort.InferenceSession, input: ort.Tensor) {
   try {
@@ -200,6 +150,11 @@ async function infer(session: ort.InferenceSession, input: ort.Tensor) {
     input.dispose();
   }
 }
+
+const tensorShape = (m: {
+  isTensor: boolean;
+  shape?: readonly (number | string)[];
+}) => (m.isTensor && m.shape ? m.shape : []);
 
 /** Decodes one local pose inference into source-image points (unflipped). */
 function decodePoseOutputs(
@@ -329,6 +284,17 @@ async function run(job: Job) {
             else port.postMessage(message);
           },
         })),
+        // Worker-side pass timings feed the same report as the coordinator's
+        // own stages, so "preprocess or inference?" is answerable from the
+        // session notes instead of guessed.
+        {
+          onPassTimings: (timings) => {
+            if (timings.preprocess)
+              timerRef?.add("pose.preprocess", timings.preprocess);
+            if (timings.infer) timerRef?.add("pose.infer", timings.infer);
+            if (timings.decode) timerRef?.add("pose.decode", timings.decode);
+          },
+        },
       );
       // Wire inbound port events into the pool's dispatcher.
       poolPorts.forEach((port, i) => {
@@ -401,10 +367,6 @@ async function run(job: Job) {
   }
 
   try {
-    const tensorShape = (m: {
-      isTensor: boolean;
-      shape?: readonly (number | string)[];
-    }) => (m.isTensor && m.shape ? m.shape : []);
     const detectorIn = tensorShape(d.session.inputMetadata[0]);
     const detectorOut = tensorShape(d.session.outputMetadata[0]);
     // Fail fast on contract mismatches before decoding any frame. In pool
@@ -426,6 +388,18 @@ async function run(job: Job) {
     if (size !== shape[3] && typeof shape[3] === "number")
       throw Error("Detector must have a square NCHW input.");
 
+    // Every stage is timed: which one dominates depends on the machine (see
+    // core/perf.ts), and the breakdown is written into the session.
+    const timer = new StageTimer();
+    timerRef = timer;
+    const detectorRaster = new Rasterizer(size, size, job.settings.detector),
+      poseRaster = new Rasterizer(
+        job.settings.width,
+        job.settings.height,
+        "pose",
+      );
+    const poseDims = [1, 3, job.settings.height, job.settings.width] as const;
+
     // A GPU session can also die *during* a run (device lost, driver reset,
     // out of memory on a large frame). Throwing away thousands of decoded
     // frames is the wrong answer: rebuild that session on WASM, say so, and
@@ -437,7 +411,9 @@ async function run(job: Job) {
       d.provider === "WebGPU" ? (d.gpuLabel ?? "WebGPU") : d.provider;
     const runDetector = async (makeInput: () => ort.Tensor) => {
       try {
-        return await infer(detectorSession, makeInput());
+        return await timer.timeAsync("detector.infer", () =>
+          infer(detectorSession, makeInput()),
+        );
       } catch (e) {
         if (detectorProvider !== "WebGPU") throw e;
         notes.push(
@@ -454,7 +430,9 @@ async function run(job: Job) {
         detectorSession = fallback.session;
         detectorProvider = "WASM";
         detectorLabel = "WASM";
-        return await infer(detectorSession, makeInput());
+        return await timer.timeAsync("detector.infer", () =>
+          infer(detectorSession, makeInput()),
+        );
       }
     };
 
@@ -503,32 +481,76 @@ async function run(job: Job) {
       return poseFallback;
     };
 
+    // Frame rasters are shared by every pass of a frame (core/preprocess.ts).
+    // Where the browser cannot hand out a bitmap, the coordinator rasterises
+    // itself and ships tensors exactly as it always did; that is slower, so it
+    // is reported rather than hidden.
+    let bitmapFallbackReported = false;
+
+    /**
+     * Rasterises one crop locally. The local path reuses one buffer because a
+     * local session runs strictly sequentially; a pool tensor job must get a
+     * fresh buffer instead, because dispatch *transfers* it.
+     */
+    const rasterPose = (
+      source: FrameSource,
+      crop: Box,
+      flip: boolean,
+      out?: Float32Array,
+    ): Float32Array => {
+      const t0 = performance.now();
+      const data = poseRaster.tensor(
+        source.image,
+        source.width,
+        source.height,
+        crop,
+        flip,
+        out,
+      );
+      timer.add("pose.preprocess", performance.now() - t0);
+      return data;
+    };
+
     /** Runs one crop/TTA pass, on the pool when active, else locally. */
     const posePass = async (
-      frame: VideoFrame,
+      source: FrameSource,
       crop: Box,
       flip: boolean,
     ): Promise<Point[]> => {
       if (pool && poolAlive) {
-        const t = tensor(
-          frame,
-          job.settings.width,
-          job.settings.height,
-          crop,
-          flip,
-          "pose",
-        );
-        const jobArg: PoseJob = {
-          data: t.data as Float32Array,
-          dims: [1, 3, job.settings.height, job.settings.width],
-          crop,
-          flip,
-          format: job.settings.format,
-        };
+        const bitmap = source.bitmapImage;
+        if (!bitmap && !bitmapFallbackReported) {
+          bitmapFallbackReported = true;
+          notes.push(
+            "This browser did not provide an ImageBitmap for the decoded frames, so crop rasterisation stays on the coordinator thread and the pose workers receive finished tensors. Parallelism is unaffected; per-pass preprocessing cost is not shared.",
+          );
+        }
+        const jobArg: PoseJob = bitmap
+          ? // The worker rasterises this pass: no per-pass cost on this
+            // thread, and it happens in parallel across the pool.
+            {
+              bitmap,
+              transfer: false,
+              crop,
+              flip,
+              format: job.settings.format,
+            }
+          : {
+              data: rasterPose(
+                source,
+                crop,
+                flip,
+                new Float32Array(poseRaster.pixels),
+              ),
+              dims: [...poseDims] as [number, number, number, number],
+              crop,
+              flip,
+              format: job.settings.format,
+            };
         try {
-          // Note: dispatch transfers the tensor buffer, so a retry must
-          // rebuild the tensor — handled by falling through to local below.
-          return await pool.dispatch(jobArg);
+          return await timer.timeAsync("pose.pass", () =>
+            pool!.dispatch(jobArg),
+          );
         } catch (e) {
           if (poolAlive) {
             poolAlive = false;
@@ -545,17 +567,13 @@ async function run(job: Job) {
       }
       let model = await ensureLocalPose();
       let outputs: Record<string, ort.Tensor>;
+      const input = () =>
+        new ort.Tensor("float32", rasterPose(source, crop, flip), poseDims);
       try {
-        outputs = await infer(
-          model.session,
-          tensor(
-            frame,
-            job.settings.width,
-            job.settings.height,
-            crop,
-            flip,
-            "pose",
-          ),
+        // Timed like the pooled path's worker-reported `pose.infer`, so GPU and
+        // CPU runs are comparable in the session report.
+        outputs = await timer.timeAsync("pose.infer", () =>
+          infer(model.session, input()),
         );
       } catch (e) {
         // A GPU session lost mid-run must not abort the analysis: rebuild it
@@ -563,29 +581,88 @@ async function run(job: Job) {
         // error and stays fatal.
         if (model.provider !== "WebGPU") throw e;
         model = await fallbackToWasmPose(model);
-        outputs = await infer(
-          model.session,
-          tensor(
-            frame,
-            job.settings.width,
-            job.settings.height,
-            crop,
-            flip,
-            "pose",
-          ),
+        outputs = await timer.timeAsync("pose.infer", () =>
+          infer(model.session, input()),
         );
       }
       try {
-        return decodePoseOutputs(
-          model.session,
-          outputs,
-          job.settings.format,
-          crop,
-          flip,
+        const decoded = await timer.timeAsync("pose.decode", async () =>
+          decodePoseOutputs(
+            model.session,
+            outputs,
+            job.settings.format,
+            crop,
+            flip,
+          ),
         );
+        return decoded;
       } finally {
         Object.values(outputs).forEach((t) => t.dispose());
       }
+    };
+
+    // Pose passes a run dispatched, and how many the adaptive gate skipped.
+    let posePasses = 0,
+      posePassesSaved = 0;
+
+    /**
+     * Runs a set of passes. Independent passes fan out across the pool; a local
+     * session stays strictly sequential because every local pass rasterises
+     * into the same reusable buffer and one session cannot overlap runs.
+     */
+    const runPasses = (
+      source: FrameSource,
+      passes: PosePass[],
+    ): Promise<Point[][]> =>
+      pool && poolAlive
+        ? Promise.all(passes.map((p) => posePass(source, p.crop, p.flip)))
+        : passes.reduce<Promise<Point[][]>>(
+            async (acc, p) => [
+              ...(await acc),
+              await posePass(source, p.crop, p.flip),
+            ],
+            Promise.resolve([]),
+          );
+
+    /**
+     * Runs the passes for one detection and fuses them.
+     *
+     * `always`/`off` dispatch every pass of the plan concurrently (results are
+     * reassembled in plan order for fusion). `adaptive` runs the first pass
+     * alone and only pays for the rest when that pass is weak; when it does,
+     * the same four passes fuse exactly as under `always`.
+     */
+    const analyseBox = async (
+      source: FrameSource,
+      box: Box,
+    ): Promise<{ box: Box; points: Point[] }> => {
+      const passes = passPlan(
+        job.settings.tta,
+        box,
+        job.settings.width,
+        job.settings.height,
+      );
+      let poses: Point[][];
+      if (job.settings.tta === "adaptive") {
+        const first = await posePass(source, passes[0].crop, passes[0].flip);
+        posePasses++;
+        if (assessPose(first).accepted) {
+          // Skipping the other passes is the whole point of the policy: the
+          // first pass already found every body joint at a usable confidence.
+          posePassesSaved += passes.length - 1;
+          return { box, points: first };
+        }
+        const rest = await runPasses(source, passes.slice(1));
+        posePasses += rest.length;
+        poses = [first, ...rest];
+      } else {
+        poses = await runPasses(source, passes);
+        posePasses += poses.length;
+      }
+      return {
+        box,
+        points: await timer.timeAsync("fuse", async () => fusePoses(poses)),
+      };
     };
 
     const tracker = new SeatTracker(job.boat),
@@ -593,124 +670,191 @@ async function run(job: Job) {
       timestamps: number[] = [];
     send(
       "status",
-      `Decoding every frame · detecting people · estimating 133 joints · pose via ${poseProvider}`,
+      `Decoding every frame · detecting people · estimating 133 joints · ${describeTta(job.settings.tta)} · pose via ${poseProvider}`,
     );
-    let lastPreview = -Infinity;
-    const meta = await decodeVideo(
-      job.file,
-      async (frame, time) => {
-        if (timestamps.length > 20000)
-          throw Error(
-            "Clip exceeds the 20,000-frame memory guard. Analyze shorter clips.",
-          );
-        const out = await runDetector(() =>
-          tensor(frame, size, size, null, false, job.settings.detector),
-        );
-        let boxes: Box[];
-        try {
-          const raw = out[detectorSession.outputNames[0]];
-          const ratio = Math.min(
-            size / frame.displayWidth,
-            size / frame.displayHeight,
-          );
-          boxes = (
-            job.settings.detector === "yolox"
-              ? decodeYolox(raw.data as Float32Array, raw.dims, size, ratio)
-              : decodeYolo(raw.data as Float32Array, raw.dims, ratio)
-          )
-            .filter((b) => {
-              const x = ((b.x + b.width / 2) / frame.displayWidth) * 100,
-                y = ((b.y + b.height / 2) / frame.displayHeight) * 100,
-                r = job.settings.region;
-              return (
-                b.width > 15 &&
-                b.height > 30 &&
-                x >= r.left &&
-                x <= r.right &&
-                y >= r.top &&
-                y <= r.bottom
-              );
-            })
-            .slice(0, 12);
-        } finally {
-          Object.values(out).forEach((t) => t.dispose());
-        }
-        // All crop/TTA passes for this frame are independent: run them
-        // concurrently across the pool (results reassembled in the original
-        // order for fusePoses). A local session stays strictly sequential.
-        const scales = job.settings.tta ? [1.25, 1.5] : [1.25];
-        const flips = job.settings.tta ? [false, true] : [false];
+    let lastPreview = -Infinity,
+      processed = 0,
+      totalSamples = 0;
+    const startedAt = performance.now();
+
+    /**
+     * Pose work for one frame, in decode order.
+     *
+     * Detection and pose are only staged when they use different hardware: with
+     * a worker pool the detector session and the pool are busy at the same time
+     * instead of taking turns, and the tracker's order requirement is met by a
+     * FIFO consumer. Without a pool (WebGPU, or a failed pool) both stages share
+     * one session on one thread, so overlapping them would buy nothing and hold
+     * extra decoded frames in memory — those runs process each frame in place,
+     * exactly as before.
+     */
+    const processFrame = async ({
+      source,
+      time,
+      boxes,
+    }: {
+      source: FrameSource;
+      time: number;
+      boxes: Box[];
+    }): Promise<void> => {
+      try {
         const detections: { box: Box; points: Point[] }[] = [];
-        const analyseBox = async (box: Box) => {
-          const passes: { crop: Box; flip: boolean }[] = [];
-          for (const scale of scales)
-            for (const flip of flips)
-              passes.push({
-                crop: paddedCrop(
-                  box,
-                  job.settings.width,
-                  job.settings.height,
-                  scale,
-                ),
-                flip,
-              });
-          const poses =
-            pool && poolAlive
-              ? await Promise.all(
-                  passes.map((p) => posePass(frame, p.crop, p.flip)),
-                )
-              : await passes.reduce<Promise<Point[][]>>(
-                  async (acc, p) => [
-                    ...(await acc),
-                    await posePass(frame, p.crop, p.flip),
-                  ],
-                  Promise.resolve([]),
-                );
-          return { box, points: fusePoses(poses) };
-        };
-        if (pool && poolAlive) {
-          detections.push(...(await Promise.all(boxes.map(analyseBox))));
-        } else {
-          for (const box of boxes) detections.push(await analyseBox(box));
+        if (boxes.length) {
+          await timer.timeAsync("pose", async () => {
+            if (pool && poolAlive) {
+              detections.push(
+                ...(await Promise.all(
+                  boxes.map((box) => analyseBox(source, box)),
+                )),
+              );
+            } else {
+              // A local session is single-threaded: passes stay sequential.
+              for (const box of boxes)
+                detections.push(await analyseBox(source, box));
+            }
+          });
         }
-        const tracked = tracker.update(detections, time);
+        const tracked = await timer.timeAsync("track", async () =>
+          tracker.update(detections, time),
+        );
         frames.push(...tracked);
-        timestamps.push(time);
+        processed++;
+        if (totalSamples)
+          send("progress", 0.02 + 0.92 * Math.min(1, processed / totalSamples));
         // Bound UI work and transfer only the latest frame, never the history.
         const now = performance.now();
         if (now - lastPreview >= 200) {
           lastPreview = now;
-          const width = frame.displayWidth,
-            height = frame.displayHeight;
-          const scale = Math.min(1, 960 / width);
-          const preview = new OffscreenCanvas(
-            Math.max(1, Math.round(width * scale)),
-            Math.max(1, Math.round(height * scale)),
-          );
-          preview
-            .getContext("2d")!
-            .drawImage(frame, 0, 0, preview.width, preview.height);
-          const bitmap = preview.transferToImageBitmap();
-          postMessage(
-            {
-              type: "preview",
-              payload: {
-                bitmap,
-                width,
-                height,
-                time,
-                processed: timestamps.length,
-                frames: tracked,
+          await timer.timeAsync("preview", async () => {
+            const width = source.width,
+              height = source.height;
+            const scale = Math.min(1, 960 / width);
+            const preview = new OffscreenCanvas(
+              Math.max(1, Math.round(width * scale)),
+              Math.max(1, Math.round(height * scale)),
+            );
+            preview
+              .getContext("2d")!
+              .drawImage(source.image, 0, 0, preview.width, preview.height);
+            const bitmap = preview.transferToImageBitmap();
+            postMessage(
+              {
+                type: "preview",
+                payload: {
+                  bitmap,
+                  width,
+                  height,
+                  time,
+                  processed,
+                  frames: tracked,
+                },
               },
-            },
-            [bitmap],
+              [bitmap],
+            );
+          });
+        }
+      } finally {
+        source.dispose();
+      }
+    };
+
+    const pipeline = new SequentialPipeline<{
+      source: FrameSource;
+      time: number;
+      boxes: Box[];
+    }>({
+      capacity: 3,
+      onDrop: (item) => item.source.dispose(),
+      handler: processFrame,
+    });
+    /** True while the pose stage can work on the next frame while the detector
+     * works on the previous one. */
+    const canOverlap = () => Boolean(pool && poolAlive);
+
+    const meta = await decodeVideo(
+      job.file,
+      async (frame, time, info) => {
+        totalSamples = info.samples.length;
+        if (timestamps.length > 20000)
+          throw Error(
+            "Clip exceeds the 20,000-frame memory guard. Analyze shorter clips.",
           );
+        // The clone outlives this callback: the decoder closes its own frame
+        // as soon as the visitor returns, while pose work for this frame is
+        // still queued or in flight.
+        const source = await FrameSource.own(frame.clone());
+        timestamps.push(time);
+        try {
+          const out = await timer.timeAsync("detector", async () =>
+            runDetector(() => {
+              const t0 = performance.now();
+              const data = detectorRaster.tensor(
+                source.image,
+                source.width,
+                source.height,
+                null,
+                false,
+              );
+              timer.add("detector.preprocess", performance.now() - t0);
+              return new ort.Tensor("float32", data, [1, 3, size, size]);
+            }),
+          );
+          let boxes: Box[];
+          try {
+            const raw = out[detectorSession.outputNames[0]];
+            const ratio = Math.min(size / source.width, size / source.height);
+            boxes = (
+              job.settings.detector === "yolox"
+                ? decodeYolox(raw.data as Float32Array, raw.dims, size, ratio)
+                : decodeYolo(raw.data as Float32Array, raw.dims, ratio)
+            )
+              .filter((b) => {
+                const x = ((b.x + b.width / 2) / source.width) * 100,
+                  y = ((b.y + b.height / 2) / source.height) * 100,
+                  r = job.settings.region;
+                return (
+                  b.width > 15 &&
+                  b.height > 30 &&
+                  x >= r.left &&
+                  x <= r.right &&
+                  y >= r.top &&
+                  y <= r.bottom
+                );
+              })
+              .slice(0, 12);
+          } finally {
+            Object.values(out).forEach((t) => t.dispose());
+          }
+          // Staged mode blocks only once `capacity` frames are queued or in
+          // flight, so a slow pose stage throttles the decoder instead of
+          // growing memory; in-place mode simply awaits the work.
+          if (canOverlap()) await pipeline.push({ source, time, boxes });
+          else await processFrame({ source, time, boxes });
+        } catch (e) {
+          source.dispose();
+          throw e;
         }
       },
-      (v) => send("progress", v * 0.94),
+      // Progress follows *processed* frames (the pose stage), not decoded
+      // ones: decoding runs ahead of the pipeline by design.
+      () => {},
     );
+    await pipeline.drain();
     send("status", "Recovering short gaps and segmenting stroke cycles…");
-    const recovered = recoverOcclusion(frames);
+    const recovered = await timer.timeAsync("recover", async () =>
+      recoverOcclusion(frames),
+    );
+    const strokes = await timer.timeAsync("strokes", async () =>
+      segmentStrokes(recovered),
+    );
+    const seconds = (performance.now() - startedAt) / 1000;
+    const performance_ = buildReport(timer, {
+      frames: processed,
+      seconds,
+      posePasses,
+      posePassesSaved,
+    });
+    notes.push(`Performance: ${performance_.summary}`);
     send("progress", 0.98);
     const session: Session = {
       version: 1,
@@ -722,7 +866,8 @@ async function run(job: Job) {
       timestamps: timestamps.sort((a, b) => a - b),
       boat: job.boat,
       frames: recovered,
-      strokes: segmentStrokes(recovered),
+      strokes,
+      performance: performance_,
       camera: estimateCamera(
         recovered.slice(0, job.boat.seats).map((f) => f.points[11]),
       ),
@@ -743,7 +888,7 @@ async function run(job: Job) {
         "Catch/finish events are hip-to-ankle cycle proxies, not directly observed blade entry/release.",
         "3D camera normalization, oar tracking, and depth-dependent biomechanics are not validated and are withheld.",
       ],
-      model: `${job.detector.name} + ${job.pose.name}; ${job.settings.width}×${job.settings.height}; ${job.settings.tta ? "flip + multi-scale TTA" : "single pass"}`,
+      model: `${job.detector.name} + ${job.pose.name}; ${job.settings.width}×${job.settings.height}; ${describeTta(job.settings.tta)}`,
       // Provider strings carry the adapter description when the GPU was used,
       // so an exported session records what actually ran where.
       provider: `${detectorLabel} detector / ${poseProvider} pose`,
@@ -752,6 +897,7 @@ async function run(job: Job) {
   } finally {
     pool?.dispose();
     activePool = null;
+    timerRef = null;
     await d.session.release().catch(() => {});
     if (localPose) await localPose.session.release();
   }

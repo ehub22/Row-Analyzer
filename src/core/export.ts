@@ -104,6 +104,7 @@ export function exportPDF(s: Session) {
     `Camera azimuth: ${s.camera.azimuth === null ? "withheld" : s.camera.azimuth + " degrees"} | confidence ${Math.round(s.camera.confidence * 100)}%`,
   );
   text(s.camera.reason);
+  if (s.performance) text(`Performance: ${s.performance.summary}`, 9);
   for (const w of s.warnings) text(`Caution: ${w}`, 10);
   y += 5;
   for (let seat = 1; seat <= s.boat.seats; seat++) {
