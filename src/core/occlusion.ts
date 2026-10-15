@@ -1,4 +1,60 @@
-import type { PoseFrame, Correction, Point } from "./types";
+import type { Boat, PoseFrame, Correction, Point } from "./types";
+
+// Expected occlusion.
+//
+// Most occlusion is transient (an oar, spray, a neighbouring rower) and the
+// short gap filler below handles it. The feet are different: they are
+// strapped to the stretcher inside the hull, below the gunwale, for the whole
+// clip. A whole-body model still returns an answer for every one of its 133
+// joints, so for hidden feet it returns a *guess*: usually a shin extrapolated
+// straight down from the knee like a seated person, sometimes the handle, the
+// rigger or the hull edge. Those guesses routinely clear the 0.3 observed
+// threshold, so before this they were tracked as observed joints: they jumped
+// between frames, were counted as evidence, drove stroke segmentation, and
+// made the adaptive TTA gate pay four passes on nearly every crop.
+//
+// No amount of tracking or test-time augmentation turns a guess into an
+// observation, so when the session says the feet are hidden the guesses are
+// dropped at the source and the joints are marked missing with a reason.
+
+/** COCO-WholeBody ankles (15, 16) and feet (17–22: big toe, small toe, heel). */
+export const FOOT_JOINTS: readonly number[] = [15, 16, 17, 18, 19, 20, 21, 22];
+
+/** Flag carried by every joint dropped as an expected occlusion. */
+export const HIDDEN_FEET_FLAG =
+  "Feet hidden by the hull (session setup); model output discarded";
+
+/** Joints the camera cannot see for this boat setup. */
+export function hiddenJoints(
+  boat: Pick<Boat, "feetHidden">,
+): readonly number[] {
+  return boat.feetHidden === false ? [] : FOOT_JOINTS;
+}
+
+/**
+ * Replaces model output for joints that cannot be visible with explicit
+ * missing points. Manual points are kept: a person who can see the joint in a
+ * frame outranks the session-wide expectation.
+ */
+export function suppressHiddenJoints(
+  points: Point[],
+  hidden: readonly number[],
+): Point[] {
+  if (!hidden.length) return points;
+  const out = points.slice();
+  for (const j of hidden) {
+    if (!out[j] || out[j].origin === "manual") continue;
+    out[j] = {
+      x: 0,
+      y: 0,
+      confidence: 0,
+      origin: "missing",
+      flags: [HIDDEN_FEET_FLAG],
+    };
+  }
+  return out;
+}
+
 export function recoverOcclusion(
   input: PoseFrame[],
   maxGap = 0.2,

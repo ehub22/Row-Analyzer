@@ -13,6 +13,12 @@
 // stroke metrics are built on, so requiring them would make every crop pay for
 // the full four-pass fusion.
 //
+// The ankles (15, 16) are body joints, but on-water footage hides them for the
+// whole clip (feet are strapped below the gunwale). Extra passes cannot reveal
+// a joint that is not in the image, so joints the session declares hidden are
+// left out of the gate (`gateJoints`). Without that, a hidden ankle below 0.3
+// rejected nearly every crop and `adaptive` silently cost as much as `always`.
+//
 // When the gate rejects a crop, the *same four passes* run and fuse exactly as
 // before; `adaptive` therefore only ever skips passes that were already
 // reliable, and never changes the result of a crop that needed fusion.
@@ -27,6 +33,14 @@ export const BODY_JOINTS: readonly number[] = Array.from(
   { length: 17 },
   (_, i) => i,
 );
+
+/** Body joints the adaptive gate should require, given joints known to be
+ * hidden for the whole session (see core/occlusion.ts `hiddenJoints`). */
+export function gateJoints(hidden: readonly number[] = []): readonly number[] {
+  return hidden.length
+    ? BODY_JOINTS.filter((j) => !hidden.includes(j))
+    : BODY_JOINTS;
+}
 
 export interface PosePass {
   /** Padded crop actually fed to the model for this pass. */
@@ -71,21 +85,24 @@ export interface PoseAssessment {
 /**
  * Confidence gate for the adaptive policy. `minMean`/`minJoint` mirror the
  * decoders' 0.3 observed/missing threshold and one comfortably-above-it level.
+ * `joints` defaults to all 17 body joints; pass `gateJoints(hidden)` to leave
+ * out joints that cannot be visible in this footage.
  */
 export function assessPose(
   points: Point[],
   minMean = 0.5,
   minJoint = 0.3,
+  joints: readonly number[] = BODY_JOINTS,
 ): PoseAssessment {
   let total = 0,
     weak = 0;
-  for (const j of BODY_JOINTS) {
+  for (const j of joints) {
     const p = points[j];
     const c = p && p.origin !== "missing" ? p.confidence : 0;
     total += c;
     if (c < minJoint) weak++;
   }
-  const mean = total / BODY_JOINTS.length;
+  const mean = total / Math.max(1, joints.length);
   return {
     accepted: weak === 0 && mean >= minMean,
     mean,
@@ -93,7 +110,7 @@ export function assessPose(
     reason:
       weak === 0 && mean >= minMean
         ? "single pass accepted"
-        : `${weak} of ${BODY_JOINTS.length} body joints below ${minJoint} (mean ${mean.toFixed(2)})`,
+        : `${weak} of ${joints.length} body joints below ${minJoint} (mean ${mean.toFixed(2)})`,
   };
 }
 

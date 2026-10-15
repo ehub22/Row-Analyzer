@@ -1,9 +1,14 @@
 import type { Session, PoseFrame, Point, Boat } from "./types";
 import { defaultBoat, missing } from "./types";
 import { segmentStrokes } from "./strokes";
+import { hiddenJoints, suppressHiddenJoints } from "./occlusion";
 export function createDemo(boat: Boat = defaultBoat): Session {
   const frames: PoseFrame[] = [],
     timestamps: number[] = [];
+  // Behave like an on-water session with the same setup: when the feet are
+  // declared hidden, the generated foot joints are discarded exactly as the
+  // analysis worker discards a pose model's guesses for them.
+  const hidden = hiddenJoints(boat);
   const duration = 12,
     fps = 30,
     width = 1440,
@@ -58,7 +63,7 @@ export function createDemo(boat: Boat = defaultBoat): Session {
       frames.push({
         time,
         seat,
-        points,
+        points: suppressHiddenJoints(points, hidden),
         box: {
           x: base - 85,
           y: 280,
@@ -78,7 +83,7 @@ export function createDemo(boat: Boat = defaultBoat): Session {
     height,
     duration,
     timestamps,
-    boat,
+    boat: { ...boat, feetHidden: hidden.length > 0 },
     frames,
     strokes: segmentStrokes(frames),
     camera: {

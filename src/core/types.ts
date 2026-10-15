@@ -45,6 +45,16 @@ export interface Boat {
   rigging: ("port" | "starboard")[];
   bestSeat: number;
   bowLeft: boolean;
+  /**
+   * Feet are strapped to the stretcher below the gunwale, so on-water footage
+   * almost never shows them. When true (the default), ankle and foot outputs
+   * are discarded as model guesses instead of being tracked (see
+   * core/occlusion.ts). Set false for ergometer or overhead footage where the
+   * feet really are in view. Boats saved before this field existed have it
+   * undefined: new analyses treat that as true, while an imported session
+   * keeps the frames it was analysed with.
+   */
+  feetHidden?: boolean;
 }
 export interface Metric {
   value: number | null;
@@ -142,6 +152,7 @@ export const defaultBoat: Boat = {
   rigging: Array.from({ length: 8 }, (_, i) => (i % 2 ? "starboard" : "port")),
   bestSeat: 8,
   bowLeft: true,
+  feetHidden: true,
 };
 export const colors = [
   "#d68349",

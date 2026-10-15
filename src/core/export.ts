@@ -99,6 +99,12 @@ export function exportPDF(s: Session) {
     `${s.name} | ${s.boat.name} | ${s.boat.discipline} | ${s.boat.seats} seats`,
   );
   text(`Model: ${s.model}`);
+  if (s.boat.feetHidden !== undefined)
+    text(
+      s.boat.feetHidden
+        ? "Feet: hidden by the hull. Ankle and foot keypoints were not estimated; cycle timing uses hip and knee motion."
+        : "Feet: visible. Ankle and foot keypoints were tracked.",
+    );
   text(`Runtime: ${s.provider}`);
   text(
     `Camera azimuth: ${s.camera.azimuth === null ? "withheld" : s.camera.azimuth + " degrees"} | confidence ${Math.round(s.camera.confidence * 100)}%`,
@@ -137,7 +143,7 @@ export function exportPDF(s: Session) {
   );
   text("Camera guidance", 16);
   text(
-    "Film alongside the shell, near perpendicular with a slight offset to separate rowers. Keep hands, feet and the whole stroke visible. For individual technique, use a closer single-seat view. Avoid bow-on footage for layback assessment.",
+    "Film alongside the shell, near perpendicular with a slight offset to separate rowers. Keep hands, hips, knees and the whole slide visible; on the water the feet sit below the gunwale and are not needed. For individual technique, use a closer single-seat view. Avoid bow-on footage for layback assessment.",
   );
   doc.save("row-analysis-report.pdf");
 }
@@ -171,6 +177,8 @@ export function validateSession(value: unknown): Session {
     s.boat.bestSeat > s.boat.seats ||
     typeof s.boat.name !== "string" ||
     typeof s.boat.bowLeft !== "boolean" ||
+    (s.boat.feetHidden !== undefined &&
+      typeof s.boat.feetHidden !== "boolean") ||
     !["sweep", "scull"].includes(s.boat.discipline) ||
     !Array.isArray(s.boat.rigging) ||
     s.boat.rigging.length < s.boat.seats ||

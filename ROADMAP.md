@@ -69,7 +69,7 @@ Milestones 1 and most of 2/3/5/6 have working engineering implementations, with 
 - Seat association is global image-space assignment, not a completed motion-compensated boat-frame tracker.
 - Occlusion recovery is short bounded interpolation and jump gating, not learned cyclic/3D completion or a full biomechanical optimizer.
 - TTA currently fuses refined coordinates, not full aligned heatmaps.
-- Stroke events are hip-to-ankle body-motion proxies, not blade-entry/release detections.
+- Stroke events are hip-to-ankle body-motion proxies, not blade-entry/release detections. (Since the hidden-feet update below: thigh-elevation proxies from hips and knees.)
 - Comparison is aggregate timing, not phase-normalized 3D or model-stroke matching.
 - Milestone 4 implements truthful abstention and known-3D transform utilities; automatic calibration/lifting remains unimplemented.
 - Milestone 7 has unit/browser/decode checks and deployment automation; actual tracking-accuracy validation is blocked by unavailable pretrained weights and absent labels. One early H.264 sample was not emitted by the test browser in each real clip; see the validation report.
@@ -177,3 +177,81 @@ Still open, in rough order of expected value on CPU-only machines:
 - **Batched pose.** Stacking the 4 TTA passes of a crop into one inference needs
   a dynamic-batch export; the contract check already ignores the batch
   dimension, so the model side is ready but no export has been validated.
+
+## Hidden-feet update (2026-10-15)
+
+On-water footage almost never shows the feet: they are strapped to the
+stretcher below the gunwale for the whole clip. A whole-body model still
+returns all 133 joints, so for the feet it returns guesses (a shin
+extrapolated down from the knee, the handle, the hull edge), and those guesses
+routinely clear the 0.3 "observed" threshold. Three parts of the pipeline
+trusted them:
+
+- **Stroke segmentation** read the catch and finish from the hip-to-ankle
+  distance and counted the ankles as evidence. Guessed ankles produced
+  catches that were not there and missed ones that were; because guesses look
+  "observed", wrong rates were reported as valid (in a seeded simulation of a
+  guessing model, about 31 spm whatever the crew rowed between 18 and 40). A
+  model that drops the ankles instead withheld every stroke.
+- **Low-rate doubling, feet or not.** The legs stay flat for a long part of
+  each recovery at low rates; keypoint noise on that plateau formed extra
+  local extrema, so 20 spm read as ~40 even with perfectly visible feet. PR #7's
+  1.2 s merge window only hid this above one particular rate.
+- **The adaptive TTA gate** required both ankles, so 64–100% of on-water crops
+  paid for all four passes: *Adaptive* silently cost as much as *Always*.
+
+Implemented:
+
+- **Expected occlusion** (`src/core/occlusion.ts`, `Boat.feetHidden`, setup
+  field *Feet in view*, default *Hidden by the hull*): ankle and foot outputs
+  (joints 15–22) are replaced by explicit missing joints with a reason before
+  tracking, preview and export. Manual points are kept. The session records
+  the setting; the viewer legend, the joint counter and the PDF report say
+  so. *Visible* restores tracking for ergometer and overhead footage.
+- **Thigh-elevation cycles** (`src/core/strokes.ts`): with the ankle fixed on
+  the stretcher and the hip on a horizontal slide, the hip→knee segment rises
+  to the catch and falls flat at the finish, so the same events come from
+  joints above the gunwale. Catches are peaks of **topographic prominence**
+  (immune to plateau noise at any rate), timed at the middle of the band
+  within 10% of the peak, because the extreme sample of a broad peak wanders
+  with noise. Evidence and withholding use hips and knees only.
+- **Hull troughs**: with the legs flat the knee sits near the saxboard and can
+  drop out of view for 40–50% of every cycle. A blind spot is bridged instead
+  of splitting the cycle when the signal is low on both sides and a hip stays
+  visible, because the hull can hide a low knee but never a catch; the finish
+  is the middle of the blind spot. A bridged cycle longer than 1.5× the seat's
+  median is dropped, since a doubled period means a catch was hidden.
+- **TTA gate** (`src/core/tta.ts` `gateJoints`): joints declared hidden are
+  left out; the gate's rejection rate on simulated on-water crops returns from
+  64% (guessed ankles) or 100% (dropped ankles) to the 7% of crops that are
+  genuinely weak.
+- **Simulation fixture** (`tests/fixtures/rowingSim.ts`): a seeded two-link
+  rower with launch drift, boat surge, keypoint noise, knee dropouts, three
+  behaviours for hidden feet (guess, drop, visible) and optional hull
+  occlusion of the knees. Results and caveats are in
+  [VALIDATION.md](docs/VALIDATION.md); `ROW_SIM_REPORT=1 npx vitest run
+  tests/feet.test.ts` reprints the table.
+
+Not changed: seat tracking, TTA fusion, decoding, and every accuracy gate.
+Sessions saved before this update keep their frames; re-importing one re-runs
+the new segmentation on them.
+
+Still open, in rough order of expected value:
+
+- **Validate on real footage.** Everything above is measured on a simulator
+  whose assumptions about model failure may not match a real export. Label
+  catches and finishes on a few on-water clips (the label export already
+  supports it) and compare.
+- **Stretcher-anchored leg angles.** The ankle could be completed from the
+  knee arc (the knee moves on a circle around the fixed ankle), but that is
+  ill-conditioned with the shin near vertical, and boat surge moves the
+  stretcher in the image. It needs real footage to validate, so knee and
+  ankle angles stay withheld.
+- **Fine-tune with occluded feet labelled missing**, so the model stops
+  guessing them (see *Labeling/fine-tuning workflow* above).
+- **Tracker re-acquisition** using the seat-order constraint: a seat is
+  dropped after 31 frames (~1 s) without a match and never comes back.
+- **Far-side eye and ear** are permanently weak in a side view and still count
+  in the TTA gate; a **fused joint** is labelled observed whenever one pass
+  cleared 0.3, even when its fused confidence is far below that (stroke timing
+  checks confidence, so it is unaffected; the evidence fraction is not).

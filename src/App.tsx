@@ -41,7 +41,7 @@ import type { Boat, Session, ModelSettings, Correction } from "./core/types";
 import { boatClasses, defaultBoat, defaultModels, colors } from "./core/types";
 import { createDemo } from "./core/demo";
 import { mean, segmentStrokes, crewTiming } from "./core/strokes";
-import { applyCorrection } from "./core/occlusion";
+import { applyCorrection, HIDDEN_FEET_FLAG } from "./core/occlusion";
 import {
   modelSpecs,
   downloadModel,
@@ -518,6 +518,11 @@ function App() {
     selectedFrame?.points.filter(
       (p) => p.origin === "observed" || p.origin === "manual",
     ).length || 0;
+  // Joints dropped because the session declares the feet hidden cannot be
+  // observed, so they do not count against the frame.
+  const observable =
+    selectedFrame?.points.filter((p) => !p.flags?.includes(HIDDEN_FEET_FLAG))
+      .length ?? 133;
   return (
     <div className="app-shell">
       <input
@@ -1029,6 +1034,31 @@ function App() {
                       </select>
                     </label>
                   </div>
+                  <label className="feet-field">
+                    Feet in view
+                    <select
+                      disabled={busy || !!session}
+                      value={
+                        currentBoat.feetHidden === false ? "visible" : "hidden"
+                      }
+                      onChange={(e) =>
+                        setBoat({
+                          ...boat,
+                          feetHidden: e.target.value === "hidden",
+                        })
+                      }
+                    >
+                      <option value="hidden">
+                        Hidden by the hull (on-water)
+                      </option>
+                      <option value="visible">Visible (erg or overhead)</option>
+                    </select>
+                    <small>
+                      {currentBoat.feetHidden === false
+                        ? "Ankle and foot keypoints are tracked like any other joint."
+                        : "Feet on the stretcher sit below the gunwale, so ankle and foot keypoints would only be model guesses. They are not estimated; stroke timing uses hips and knees."}
+                    </small>
+                  </label>
                   {currentBoat.discipline === "sweep" && (
                     <details className="rigging">
                       <summary>
@@ -1183,8 +1213,14 @@ function App() {
                       </select>
                     </label>
                     <div>
-                      <strong>{observed} / 133</strong>
-                      <span> observed or manually corrected</span>
+                      <strong>
+                        {observed} / {observable}
+                      </strong>
+                      <span>
+                        {" "}
+                        observed or manually corrected
+                        {observable < 133 ? " · feet hidden by hull" : ""}
+                      </span>
                     </div>
                     <button
                       className="button"
@@ -1281,7 +1317,7 @@ function App() {
                           <p>
                             {rows.length
                               ? `The ${crew ? "crew" : "selected seat"} has ${rows.length} complete seat-cycles available for review. ${rate ? `Average stroke rate is ${rate.toFixed(1)} strokes per minute.` : "Stroke rate is withheld because observed evidence is insufficient."}`
-                              : "No complete, sufficiently visible cycles were found. Review hip and ankle tracking, or use a longer, closer side-view clip."}
+                              : "No complete, sufficiently visible cycles were found. Review hip and knee tracking, or use a longer, closer side-view clip."}
                           </p>
                           <div className="insight-tip">
                             <Focus size={18} />
@@ -1891,7 +1927,7 @@ function App() {
                       <h3>Give each seat some space</h3>
                       <p>
                         For an individual, use a closer view that includes
-                        hands, feet, and the full slide. Exclude the coxswain
+                        hands, knees, and the full slide. Exclude the coxswain
                         and bystanders or initialization will stop for review.
                       </p>
                     </div>
