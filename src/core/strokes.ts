@@ -31,14 +31,12 @@ export function segmentStrokes(frames: PoseFrame[]): Stroke[] {
         )
           distances.push(Math.hypot(a.x - b.x, a.y - b.y) / f.box.height);
       }
-      return distances.length
-        ? distances.reduce((a, b) => a + b) / distances.length
-        : null;
+      return distances.length ? Math.max(...distances) : null;
     });
     const signal = raw.map((v, i) => {
       if (v === null) return null;
       const values = raw
-        .slice(Math.max(0, i - 2), i + 3)
+        .slice(Math.max(0, i - 3), i + 4)
         .filter((x): x is number => x !== null);
       return values.reduce((a, b) => a + b, 0) / values.length;
     });
@@ -49,7 +47,7 @@ export function segmentStrokes(frames: PoseFrame[]): Stroke[] {
         continue;
       if (v <= signal[i - 1]! && v < signal[i + 1]!) {
         const last = catches.at(-1);
-        if (last === undefined || seq[i].time - seq[last].time > 1) {
+        if (last === undefined || seq[i].time - seq[last].time > 1.2) {
           catches.push(i);
         } else if (v < signal[last]!) catches[catches.length - 1] = i;
       }
