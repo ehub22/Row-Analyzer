@@ -8,7 +8,12 @@ import {
 } from "../src/core/geometry";
 import { createDemo } from "../src/core/demo";
 import { recoverOcclusion, applyCorrection } from "../src/core/occlusion";
-import { segmentStrokes, crewTiming, mean } from "../src/core/strokes";
+import {
+  segmentStrokes,
+  crewTiming,
+  crewMean,
+  mean,
+} from "../src/core/strokes";
 import { SeatTracker } from "../src/core/tracking";
 import { paddedCrop, nms, decodeYolox } from "../src/core/detection";
 import { decodeSimCC, decodeHeatmap, unflip } from "../src/core/pose";
@@ -67,6 +72,17 @@ describe("top-down pose math", () => {
   });
   it("requires documented detector output shape", () => {
     expect(() => decodeYolox(new Float32Array(2), [1, 6], 640, 1)).toThrow();
+  });
+  it("decodes the smaller YOLOX 416 raw-grid contract", () => {
+    const data = new Float32Array(3549 * 85);
+    const index = (10 * 52 + 10) * 85;
+    data.set([0.5, 0.5, Math.log(40 / 8), Math.log(80 / 8), 0.9, 0.9], index);
+    const boxes = decodeYolox(data, [1, 3549, 85], 416, 1);
+    expect(boxes).toHaveLength(1);
+    expect(boxes[0].x).toBeCloseTo(64);
+    expect(boxes[0].y).toBeCloseTo(44);
+    expect(boxes[0].width).toBeCloseTo(40);
+    expect(boxes[0].height).toBeCloseTo(80);
   });
   it("decodes and subpixel-refines whole-body SimCC", () => {
     const x = new Float32Array(133 * 8),
@@ -210,6 +226,15 @@ describe("cycle timing and evidence gates", () => {
     expect(mean(rows.map((s) => s.rate.value))).toBeCloseTo(25, 0);
     expect(mean(rows.map((s) => s.ratio.value))!).toBeGreaterThan(0.5);
     expect(mean(rows.map((s) => s.ratio.value))!).toBeLessThan(0.9);
+  });
+  it("withholds a crew-wide average when only one seat has reliable cycles", () => {
+    const sparse = structuredClone(demo.strokes);
+    sparse.forEach((stroke, i) => {
+      if (i > 0) stroke.rate.value = null;
+    });
+    expect(crewMean(sparse, 8, (s) => s.rate.value)).toBeNull();
+    const representative = demo.strokes.filter((s) => s.seat <= 4);
+    expect(crewMean(representative, 8, (s) => s.rate.value)).toBeCloseTo(25, 0);
   });
   it("resolves crew timing only for matched cycles", () => {
     const timing = crewTiming(demo.strokes, 8);

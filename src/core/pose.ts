@@ -20,12 +20,13 @@ export function decodeSimCC(
   nx: number,
   ny: number,
   crop: Box,
+  joints: 17 | 133 = 133,
 ): Point[] {
-  if (x.length !== 133 * nx || y.length !== 133 * ny)
+  if (x.length !== joints * nx || y.length !== joints * ny)
     throw Error(
-      "Whole-body model must output 133 joints as two SimCC tensors.",
+      `Pose model must output ${joints} joints as two SimCC tensors.`,
     );
-  return Array.from({ length: 133 }, (_, j) => {
+  return Array.from({ length: joints }, (_, j) => {
     const a = peak(x, j * nx, nx),
       b = peak(y, j * ny, ny);
     const confidence = clamp(Math.min(a.score, b.score));
@@ -42,10 +43,11 @@ export function decodeHeatmap(
   w: number,
   h: number,
   crop: Box,
+  joints: 17 | 133 = 133,
 ): Point[] {
-  if (data.length !== 133 * w * h)
-    throw Error("Heatmap model must output [1,133,H,W].");
-  return Array.from({ length: 133 }, (_, j) => {
+  if (data.length !== joints * w * h)
+    throw Error(`Heatmap model must output [1,${joints},H,W].`);
+  return Array.from({ length: joints }, (_, j) => {
     const base = j * w * h;
     let k = 0;
     for (let i = 1; i < w * h; i++) if (data[base + i] > data[base + k]) k = i;
@@ -69,10 +71,14 @@ export function decodeHeatmap(
   });
 }
 export function unflip(points: Point[], crop: Box): Point[] {
-  return flipIndices.map((j) => ({
-    ...points[j],
-    x: crop.x + crop.width - (points[j].x - crop.x),
-  }));
+  if (points.length !== 17 && points.length !== 133)
+    throw Error("Expected COCO-17 or COCO-WholeBody-133 points.");
+  return flipIndices.slice(0, points.length).map((j) => {
+    const point = points[j];
+    return point.origin === "missing"
+      ? { ...point }
+      : { ...point, x: crop.x + crop.width - (point.x - crop.x) };
+  });
 }
 export function fusePoses(poses: Point[][]): Point[] {
   return poses[0].map((_, j) => {

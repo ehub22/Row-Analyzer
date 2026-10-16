@@ -48,8 +48,21 @@ describe("PoseWorkerPool", () => {
     const pool = new PoseWorkerPool(endpoints);
     const ready = pool.ready();
     pool.init({ wasmThreads: 1 });
-    expect(endpoints.every((e) => e.sent[0].message.type === "init")).toBe(true);
+    expect(endpoints.every((e) => e.sent[0].message.type === "init")).toBe(
+      true,
+    );
     pool.handleMessage(1, { type: "ready" });
+    await expect(ready).resolves.toBeUndefined();
+    expect(pool.aliveCount).toBe(1);
+  });
+
+  it("rejects a worker whose verified joint layout differs from the selection", async () => {
+    const pool = new PoseWorkerPool([new FakeEndpoint(), new FakeEndpoint()]);
+    const ready = pool.ready();
+    pool.init({ joints: 17 });
+    pool.handleMessage(0, { type: "ready", joints: 133 });
+    expect(pool.deadCount).toBe(1);
+    pool.handleMessage(1, { type: "ready", joints: 17 });
     await expect(ready).resolves.toBeUndefined();
     expect(pool.aliveCount).toBe(1);
   });
@@ -74,8 +87,16 @@ describe("PoseWorkerPool", () => {
     const firstId = endpoints[busy].jobs[0].message.id as number;
     const secondId = endpoints[busy].jobs[1].message.id as number;
     // Answer the later job first; promises must still match by id.
-    pool.handleMessage(busy, { type: "pose-result", id: secondId, points: points(2) });
-    pool.handleMessage(busy, { type: "pose-result", id: firstId, points: points(1) });
+    pool.handleMessage(busy, {
+      type: "pose-result",
+      id: secondId,
+      points: points(2),
+    });
+    pool.handleMessage(busy, {
+      type: "pose-result",
+      id: firstId,
+      points: points(1),
+    });
     const other = endpoints[1 - busy];
     pool.handleMessage(1 - busy, {
       type: "pose-result",
@@ -148,7 +169,11 @@ describe("PoseWorkerPool", () => {
     // The coordinator keeps its bitmap so every other pass of the same frame
     // can use it too; posting it without a transfer list serializes a handle.
     const { pool, endpoints } = readyPool(1);
-    const bitmap = { width: 640, height: 360, close() {} } as unknown as ImageBitmap;
+    const bitmap = {
+      width: 640,
+      height: 360,
+      close() {},
+    } as unknown as ImageBitmap;
     const job: BitmapPoseJob = {
       bitmap,
       transfer: false,
@@ -167,6 +192,49 @@ describe("PoseWorkerPool", () => {
       points: points(0),
     });
     await p;
+  });
+
+  it("transfers a dedicated bitmap handle to its worker", async () => {
+    const original = globalThis.ImageBitmap;
+    class FakeBitmap {
+      width = 640;
+      height = 360;
+      close() {}
+    }
+    Object.defineProperty(globalThis, "ImageBitmap", {
+      configurable: true,
+      value: FakeBitmap,
+    });
+    try {
+      const { pool, endpoints } = readyPool(1);
+      const bitmap = new FakeBitmap() as unknown as ImageBitmap;
+      const pending = pool.dispatch({
+        bitmap,
+        transfer: true,
+        crop: { x: 40, y: 50, width: 10, height: 10, confidence: 1 },
+        rasterCrop: { x: 2, y: 3, width: 10, height: 10, confidence: 1 },
+        flip: false,
+        format: "simcc",
+      });
+      const sent = endpoints[0].jobs[0];
+      expect(sent.transfer).toEqual([bitmap]);
+      expect(sent.message.rasterCrop).toMatchObject({ x: 2, y: 3 });
+      expect(sent.message.crop).toMatchObject({ x: 40, y: 50 });
+      pool.handleMessage(0, {
+        type: "pose-result",
+        id: sent.message.id,
+        points: points(0),
+      });
+      await pending;
+    } finally {
+      if (original === undefined)
+        delete (globalThis as { ImageBitmap?: typeof ImageBitmap }).ImageBitmap;
+      else
+        Object.defineProperty(globalThis, "ImageBitmap", {
+          configurable: true,
+          value: original,
+        });
+    }
   });
 
   it("reports worker-side pass timings without changing the job result", async () => {

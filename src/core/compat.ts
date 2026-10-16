@@ -37,41 +37,70 @@ export function checkDetectorContract(
   }
 }
 
-/** DWPose / RTMW SimCC or whole-body heatmap export with 133 joints. */
+/** Shape-level check for a selected COCO-17 or COCO-WholeBody-133 export. */
 export function checkPoseContract(
   input: Shape,
-  outputs: Shape[],
+  outputs: readonly Shape[],
   format: "simcc" | "heatmap",
   width: number,
   height: number,
+  joints: 17 | 133 = 133,
 ): void {
   const model = "Pose model";
-  if (input.length !== 4)
+  if (
+    input.length !== 4 ||
+    (isNum(input[0]) && input[0] !== 1) ||
+    (isNum(input[1]) && input[1] !== 3)
+  )
     fail(model, `expected [1,3,H,W] input, got [${input.join(",")}].`);
   if (isNum(input[2]) && input[2] !== height)
     fail(model, `input height is ${input[2]} but settings say ${height}.`);
   if (isNum(input[3]) && input[3] !== width)
     fail(model, `input width is ${input[3]} but settings say ${width}.`);
-  if (format === "simcc") {
-    if (outputs.length !== 2)
+  const expected = format === "simcc" ? 2 : 1;
+  const rank = format === "simcc" ? 3 : 4;
+  if (outputs.length !== expected)
+    fail(
+      model,
+      `${format} needs ${expected} output${expected === 1 ? "" : "s"}; found ${outputs.length}.`,
+    );
+  for (const output of outputs)
+    if (
+      output.length !== rank ||
+      (isNum(output[0]) && output[0] !== 1) ||
+      (isNum(output[1]) && output[1] !== joints)
+    )
       fail(
         model,
-        `SimCC needs two outputs (x, y); found ${outputs.length}. A 17-joint body model is not whole-body.`,
+        `selected ${joints}-joint ${format} layout, got [${output.join(",")}].`,
       );
-    for (const o of outputs)
-      if (o.length !== 3 || (isNum(o[1]) && o[1] !== 133))
-        fail(
-          model,
-          `expected 133 joints per SimCC axis, got [${o.join(",")}]. A COCO-17 body checkpoint is not supported.`,
-        );
-  } else {
-    const o = outputs[0];
-    if (
-      outputs.length !== 1 ||
-      !o ||
-      o.length !== 4 ||
-      (isNum(o[1]) && o[1] !== 133)
-    )
-      fail(model, `expected one [1,133,H,W] heatmap output.`);
+}
+
+/** Metadata may be symbolic; the first real output shapes must still agree. */
+export function checkPoseOutputDims(
+  outputs: readonly (readonly number[])[],
+  format: "simcc" | "heatmap",
+  width: number,
+  height: number,
+  joints: 17 | 133,
+): void {
+  checkPoseContract(
+    [1, 3, height, width],
+    outputs,
+    format,
+    width,
+    height,
+    joints,
+  );
+  if (outputs.some((dims) => dims.some((n) => !Number.isInteger(n) || n <= 0)))
+    fail("Pose model", "output dimensions must be positive integers.");
+  if (format === "simcc") {
+    const xScale = outputs[0][2] / width;
+    const yScale = outputs[1][2] / height;
+    if (Math.abs(xScale - yScale) > 1e-4)
+      fail(
+        "Pose model",
+        "SimCC x/y axes do not use the same coordinate scale or are reversed.",
+      );
   }
 }

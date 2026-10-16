@@ -11,7 +11,12 @@ import { decodeVideo } from "../core/video";
 import { decodeYolo, decodeYolox } from "../core/detection";
 import { decodeSimCC, decodeHeatmap, unflip, fusePoses } from "../core/pose";
 import { SeatTracker } from "../core/tracking";
-import { checkDetectorContract, checkPoseContract } from "../core/compat";
+import {
+  checkDetectorContract,
+  checkPoseContract,
+  checkPoseOutputDims,
+} from "../core/compat";
+import { padPose } from "../core/bodyLayout";
 import {
   hiddenJoints,
   recoverOcclusion,
@@ -19,9 +24,14 @@ import {
 } from "../core/occlusion";
 import { segmentStrokes } from "../core/strokes";
 import { estimateCamera } from "../core/geometry";
-import { FrameSource, Rasterizer } from "../core/preprocess";
+import { FrameSource, Rasterizer, transferCrop } from "../core/preprocess";
 import { SequentialPipeline } from "../core/queue";
 import { StageTimer, buildReport } from "../core/perf";
+import {
+  needsFreshDetection,
+  predictBoxes,
+  usePredictedBoxes,
+} from "../core/cadence";
 import {
   assessPose,
   describeTta,
@@ -75,6 +85,8 @@ interface LoadedModel {
   provider: "WebGPU" | "WASM";
   /** Adapter description when running on the GPU, for the session record. */
   gpuLabel?: string;
+  /** Actual output shapes from WebGPU's mandatory warm-up. */
+  warmupDims?: number[][];
 }
 
 /**
@@ -110,11 +122,17 @@ async function loadModel(
         );
         try {
           const out = await session.run({ [session.inputNames[0]]: probe });
+          const warmupDims = session.outputNames.map((n) => [...out[n].dims]);
           Object.values(out).forEach((t) => t.dispose());
+          return {
+            session,
+            provider: "WebGPU",
+            gpuLabel: opts.gpuLabel,
+            warmupDims,
+          } as LoadedModel;
         } finally {
           probe.dispose();
         }
-        return { session, provider: "WebGPU", gpuLabel: opts.gpuLabel };
       } catch (e) {
         await session.release().catch(() => {});
         throw e;
@@ -166,6 +184,46 @@ const tensorShape = (m: {
   shape?: readonly (number | string)[];
 }) => (m.isTensor && m.shape ? m.shape : []);
 
+async function verifyPoseModel(
+  model: LoadedModel,
+  settings: ModelSettings,
+): Promise<void> {
+  const session = model.session;
+  checkPoseContract(
+    tensorShape(session.inputMetadata[0]),
+    session.outputMetadata.map(tensorShape),
+    settings.format,
+    settings.width,
+    settings.height,
+    settings.poseJoints,
+  );
+  let dims = model.warmupDims;
+  if (!dims) {
+    const probe = new ort.Tensor(
+      "float32",
+      new Float32Array(3 * settings.width * settings.height),
+      [1, 3, settings.height, settings.width],
+    );
+    try {
+      const outputs = await session.run({ [session.inputNames[0]]: probe });
+      try {
+        dims = session.outputNames.map((name) => [...outputs[name].dims]);
+      } finally {
+        Object.values(outputs).forEach((tensor) => tensor.dispose());
+      }
+    } finally {
+      probe.dispose();
+    }
+  }
+  checkPoseOutputDims(
+    dims,
+    settings.format,
+    settings.width,
+    settings.height,
+    settings.poseJoints,
+  );
+}
+
 /** Decodes one local pose inference into source-image points (unflipped). */
 function decodePoseOutputs(
   session: ort.InferenceSession,
@@ -173,40 +231,40 @@ function decodePoseOutputs(
   format: "simcc" | "heatmap",
   crop: Box,
   flip: boolean,
+  width: number,
+  height: number,
+  joints: 17 | 133,
 ): Point[] {
   const vals = session.outputNames.map((n) => outputs[n]);
-  let points: Point[];
-  if (format === "simcc") {
-    if (
-      vals.length !== 2 ||
-      vals[0].dims.length !== 3 ||
-      vals[0].dims[1] !== 133 ||
-      vals[1].dims[1] !== 133
-    )
-      throw Error(
-        "Expected a 133-joint whole-body SimCC export, not a 17-joint body model.",
-      );
-    points = decodeSimCC(
-      vals[0].data as Float32Array,
-      vals[1].data as Float32Array,
-      vals[0].dims[2],
-      vals[1].dims[2],
-      crop,
-    );
-  } else {
-    if (vals[0].dims.length !== 4 || vals[0].dims[1] !== 133)
-      throw Error("Expected [1,133,H,W] heatmaps.");
-    points = decodeHeatmap(
-      vals[0].data as Float32Array,
-      vals[0].dims[3],
-      vals[0].dims[2],
-      crop,
-    );
-  }
-  return flip ? unflip(points, crop) : points;
+  checkPoseOutputDims(
+    vals.map((v) => v.dims),
+    format,
+    width,
+    height,
+    joints,
+  );
+  const points =
+    format === "simcc"
+      ? decodeSimCC(
+          vals[0].data as Float32Array,
+          vals[1].data as Float32Array,
+          vals[0].dims[2],
+          vals[1].dims[2],
+          crop,
+          joints,
+        )
+      : decodeHeatmap(
+          vals[0].data as Float32Array,
+          vals[0].dims[3],
+          vals[0].dims[2],
+          crop,
+          joints,
+        );
+  return padPose(flip ? unflip(points, crop) : points, joints);
 }
 
 async function run(job: Job) {
+  const startedRun = performance.now();
   const plan: ParallelPlan =
     job.parallel ?? planParallelism(readParallelEnv(), job.settings.workers);
   const notes: string[] = [];
@@ -317,6 +375,7 @@ async function run(job: Job) {
         // instead of structured-cloning a ~134 MB ArrayBuffer per worker.
         poseFile: job.pose,
         format: job.settings.format,
+        joints: job.settings.poseJoints,
         width: job.settings.width,
         height: job.settings.height,
         wasmThreads: plan.wasmThreads,
@@ -384,15 +443,7 @@ async function run(job: Job) {
     // bad model kills every worker, pool.ready() rejects, and the local
     // fallback session created above then throws the precise error here).
     checkDetectorContract(detectorIn, detectorOut, job.settings.detector);
-    if (localPose) {
-      checkPoseContract(
-        tensorShape(localPose.session.inputMetadata[0]),
-        localPose.session.outputMetadata.map(tensorShape),
-        job.settings.format,
-        job.settings.width,
-        job.settings.height,
-      );
-    }
+    if (localPose) await verifyPoseModel(localPose, job.settings);
     const shape = detectorIn;
     const size = typeof shape[2] === "number" ? shape[2] : 640;
     if (size !== shape[3] && typeof shape[3] === "number")
@@ -420,9 +471,10 @@ async function run(job: Job) {
     let detectorLabel =
       d.provider === "WebGPU" ? (d.gpuLabel ?? "WebGPU") : d.provider;
     const runDetector = async (makeInput: () => ort.Tensor) => {
+      const input = makeInput();
       try {
         return await timer.timeAsync("detector.infer", () =>
-          infer(detectorSession, makeInput()),
+          infer(detectorSession, input),
         );
       } catch (e) {
         if (detectorProvider !== "WebGPU") throw e;
@@ -440,8 +492,9 @@ async function run(job: Job) {
         detectorSession = fallback.session;
         detectorProvider = "WASM";
         detectorLabel = "WASM";
+        const retry = makeInput();
         return await timer.timeAsync("detector.infer", () =>
-          infer(detectorSession, makeInput()),
+          infer(detectorSession, retry),
         );
       }
     };
@@ -458,14 +511,13 @@ async function run(job: Job) {
             probeDimsFrom(s, [1, 3, job.settings.height, job.settings.width]),
           notes,
         });
-        checkPoseContract(
-          tensorShape(m.session.inputMetadata[0]),
-          m.session.outputMetadata.map(tensorShape),
-          job.settings.format,
-          job.settings.width,
-          job.settings.height,
-        );
-        return m;
+        try {
+          await verifyPoseModel(m, job.settings);
+          return m;
+        } catch (error) {
+          await m.session.release().catch(() => {});
+          throw error;
+        }
       })();
       localPose = await localPosePromise;
       return localPose;
@@ -535,12 +587,28 @@ async function run(job: Job) {
             "This browser did not provide an ImageBitmap for the decoded frames, so crop rasterisation stays on the coordinator thread and the pose workers receive finished tensors. Parallelism is unaffected; per-pass preprocessing cost is not shared.",
           );
         }
+        // Transfer only the pixels the crop can sample, not a 1920×1080
+        // bitmap for each person. Integer bounds include a filter margin;
+        // rasterCrop remaps the worker draw while crop still decodes to the
+        // original frame. If cropping fails, use the original dispatch path.
+        const bounds = bitmap
+          ? transferCrop(crop, source.width, source.height)
+          : null;
+        const cutBitmap =
+          bitmap && bounds
+            ? await createImageBitmap(
+                bitmap,
+                bounds.sx,
+                bounds.sy,
+                bounds.sw,
+                bounds.sh,
+              ).catch(() => null)
+            : null;
         const jobArg: PoseJob = bitmap
-          ? // The worker rasterises this pass: no per-pass cost on this
-            // thread, and it happens in parallel across the pool.
-            {
-              bitmap,
-              transfer: false,
+          ? {
+              bitmap: cutBitmap ?? bitmap,
+              transfer: Boolean(cutBitmap),
+              rasterCrop: cutBitmap ? bounds!.localCrop : undefined,
               crop,
               flip,
               format: job.settings.format,
@@ -562,6 +630,7 @@ async function run(job: Job) {
             pool!.dispatch(jobArg),
           );
         } catch (e) {
+          if (cutBitmap?.width) cutBitmap.close();
           if (poolAlive) {
             poolAlive = false;
             notes.push(
@@ -582,8 +651,9 @@ async function run(job: Job) {
       try {
         // Timed like the pooled path's worker-reported `pose.infer`, so GPU and
         // CPU runs are comparable in the session report.
+        const tensor = input();
         outputs = await timer.timeAsync("pose.infer", () =>
-          infer(model.session, input()),
+          infer(model.session, tensor),
         );
       } catch (e) {
         // A GPU session lost mid-run must not abort the analysis: rebuild it
@@ -591,8 +661,9 @@ async function run(job: Job) {
         // error and stays fatal.
         if (model.provider !== "WebGPU") throw e;
         model = await fallbackToWasmPose(model);
+        const tensor = input();
         outputs = await timer.timeAsync("pose.infer", () =>
-          infer(model.session, input()),
+          infer(model.session, tensor),
         );
       }
       try {
@@ -603,6 +674,9 @@ async function run(job: Job) {
             job.settings.format,
             crop,
             flip,
+            job.settings.width,
+            job.settings.height,
+            job.settings.poseJoints,
           ),
         );
         return decoded;
@@ -623,6 +697,10 @@ async function run(job: Job) {
     if (hidden.length)
       notes.push(
         "Feet hidden by the hull (session setup): ankle and foot keypoints are not estimated, because a pose model can only guess joints below the gunwale. Stroke timing uses hip and knee motion, and the adaptive TTA gate ignores the hidden joints.",
+      );
+    if (job.settings.poseJoints === 17)
+      notes.push(
+        "Body-only model: feet, face, and hands (joints 17–132) are not supplied by the model and remain missing unless manually labeled. Stroke timing uses observed hips and knees; accuracy still requires review.",
       );
 
     /**
@@ -694,12 +772,82 @@ async function run(job: Job) {
       timestamps: number[] = [];
     send(
       "status",
-      `Decoding every frame · detecting people · estimating 133 joints · ${describeTta(job.settings.tta)} · pose via ${poseProvider}`,
+      `Decoding and posing every available frame · ${job.settings.detectorCadence === "auto" ? "guarded detector cadence" : "fresh detection every frame"} · estimating ${job.settings.poseJoints} joints · ${describeTta(job.settings.tta)} · pose via ${poseProvider}`,
     );
     let lastPreview = -Infinity,
       processed = 0,
-      totalSamples = 0;
+      totalSamples = 0,
+      detectorRuns = 0,
+      predictedFrames = 0,
+      detectorRefreshes = 0,
+      lastDetectorFrame = -1,
+      lastDetectorTime = -Infinity;
+    let lastTracked: PoseFrame[] | null = null,
+      previousTracked: PoseFrame[] | null = null;
+    const refreshFrames: number[] = [];
     const startedAt = performance.now();
+    const setupSeconds = (startedAt - startedRun) / 1000;
+
+    const markDetector = (index: number, time: number) => {
+      if (index >= lastDetectorFrame) {
+        lastDetectorFrame = index;
+        lastDetectorTime = time;
+      }
+    };
+
+    // A same-frame refresh can run in the pose consumer while an anchor's
+    // detector runs in the producer. The reusable raster buffer and ORT session
+    // must never be used concurrently, including across a GPU fallback.
+    let detectorTurn: Promise<void> = Promise.resolve();
+    const detectFrame = (source: FrameSource): Promise<Box[]> => {
+      const task = detectorTurn.then(async () => {
+        detectorRuns++;
+        const out = await timer.timeAsync("detector", async () =>
+          runDetector(() => {
+            const t0 = performance.now();
+            const data = detectorRaster.tensor(
+              source.image,
+              source.width,
+              source.height,
+              null,
+              false,
+            );
+            timer.add("detector.preprocess", performance.now() - t0);
+            return new ort.Tensor("float32", data, [1, 3, size, size]);
+          }),
+        );
+        try {
+          const raw = out[detectorSession.outputNames[0]];
+          const ratio = Math.min(size / source.width, size / source.height);
+          return (
+            job.settings.detector === "yolox"
+              ? decodeYolox(raw.data as Float32Array, raw.dims, size, ratio)
+              : decodeYolo(raw.data as Float32Array, raw.dims, ratio)
+          )
+            .filter((b) => {
+              const x = ((b.x + b.width / 2) / source.width) * 100,
+                y = ((b.y + b.height / 2) / source.height) * 100,
+                r = job.settings.region;
+              return (
+                b.width > 15 &&
+                b.height > 30 &&
+                x >= r.left &&
+                x <= r.right &&
+                y >= r.top &&
+                y <= r.bottom
+              );
+            })
+            .slice(0, 12);
+        } finally {
+          Object.values(out).forEach((t) => t.dispose());
+        }
+      });
+      detectorTurn = task.then(
+        () => {},
+        () => {},
+      );
+      return task;
+    };
 
     /**
      * Pose work for one frame, in decode order.
@@ -715,32 +863,74 @@ async function run(job: Job) {
     const processFrame = async ({
       source,
       time,
+      index,
       boxes,
+      boxSource,
+      detectorAge,
     }: {
       source: FrameSource;
       time: number;
+      index: number;
       boxes: Box[];
+      boxSource: "detected" | "predicted";
+      detectorAge: number;
     }): Promise<void> => {
       try {
-        const detections: { box: Box; points: Point[] }[] = [];
-        if (boxes.length) {
-          await timer.timeAsync("pose", async () => {
-            if (pool && poolAlive) {
-              detections.push(
-                ...(await Promise.all(
-                  boxes.map((box) => analyseBox(source, box)),
-                )),
-              );
-            } else {
-              // A local session is single-threaded: passes stay sequential.
-              for (const box of boxes)
-                detections.push(await analyseBox(source, box));
-            }
+        const poseBoxes = async (crops: Box[]) => {
+          if (!crops.length) return [];
+          return timer.timeAsync("pose", async () => {
+            if (pool && poolAlive)
+              return Promise.all(crops.map((box) => analyseBox(source, box)));
+            // A local session is single-threaded: passes stay sequential.
+            const results: { box: Box; points: Point[] }[] = [];
+            for (const box of crops)
+              results.push(await analyseBox(source, box));
+            return results;
           });
+        };
+        let detections = await poseBoxes(boxes);
+        if (boxSource === "predicted") {
+          const proposal = detections.map((d) => ({
+            ...d,
+            boxSource,
+            detectorAge,
+          }));
+          const preview = tracker.preview(proposal, time);
+          if (
+            detections.some((d) =>
+              needsFreshDetection(
+                d.points,
+                d.box,
+                source.width,
+                source.height,
+                gate,
+              ),
+            ) ||
+            preview.some((f) => f.identityConfidence < 0.55)
+          ) {
+            detectorRefreshes++;
+            refreshFrames.push(index);
+            boxes = await detectFrame(source);
+            markDetector(index, time);
+            detections = await poseBoxes(boxes);
+            boxSource = "detected";
+            detectorAge = 0;
+          } else predictedFrames++;
         }
-        const tracked = await timer.timeAsync("track", async () =>
-          tracker.update(detections, time),
-        );
+        const tracked = await timer.timeAsync("track", async () => {
+          const results = tracker.update(
+            detections.map((d) => ({ ...d, boxSource, detectorAge })),
+            time,
+          );
+          return job.settings.poseJoints === 17
+            ? results.map((frame) => ({
+                ...frame,
+                points: padPose(frame.points, 17),
+              }))
+            : results;
+        });
+        previousTracked = lastTracked;
+        lastTracked = tracked;
         frames.push(...tracked);
         processed++;
         if (totalSamples)
@@ -785,7 +975,10 @@ async function run(job: Job) {
     const pipeline = new SequentialPipeline<{
       source: FrameSource;
       time: number;
+      index: number;
       boxes: Box[];
+      boxSource: "detected" | "predicted";
+      detectorAge: number;
     }>({
       capacity: 3,
       onDrop: (item) => item.source.dispose(),
@@ -807,53 +1000,54 @@ async function run(job: Job) {
         // as soon as the visitor returns, while pose work for this frame is
         // still queued or in flight.
         const source = await FrameSource.own(frame.clone());
+        const index = timestamps.length;
         timestamps.push(time);
         try {
-          const out = await timer.timeAsync("detector", async () =>
-            runDetector(() => {
-              const t0 = performance.now();
-              const data = detectorRaster.tensor(
-                source.image,
+          const refreshes = refreshFrames.filter((n) => index - n <= 24).length;
+          const eligible =
+            job.settings.detectorCadence === "auto" &&
+            usePredictedBoxes({
+              frameIndex: index,
+              time,
+              lastDetectorFrame,
+              lastDetectorTime,
+              completedFrames: processed,
+              detectorMs: timer.perCall("detector"),
+              poseMs: timer.perCall("pose"),
+              overlapping: canOverlap(),
+              recentRefreshes: refreshes,
+            });
+          // The last pose/track must be committed before its boxes can seed a
+          // prediction. Anchors can still overlap preceding pose work.
+          if (eligible && canOverlap()) await pipeline.drain();
+          const predicted = eligible
+            ? predictBoxes(
+                lastTracked,
+                previousTracked,
+                time,
                 source.width,
                 source.height,
-                null,
-                false,
-              );
-              timer.add("detector.preprocess", performance.now() - t0);
-              return new ort.Tensor("float32", data, [1, 3, size, size]);
-            }),
-          );
-          let boxes: Box[];
-          try {
-            const raw = out[detectorSession.outputNames[0]];
-            const ratio = Math.min(size / source.width, size / source.height);
-            boxes = (
-              job.settings.detector === "yolox"
-                ? decodeYolox(raw.data as Float32Array, raw.dims, size, ratio)
-                : decodeYolo(raw.data as Float32Array, raw.dims, ratio)
-            )
-              .filter((b) => {
-                const x = ((b.x + b.width / 2) / source.width) * 100,
-                  y = ((b.y + b.height / 2) / source.height) * 100,
-                  r = job.settings.region;
-                return (
-                  b.width > 15 &&
-                  b.height > 30 &&
-                  x >= r.left &&
-                  x <= r.right &&
-                  y >= r.top &&
-                  y <= r.bottom
-                );
-              })
-              .slice(0, 12);
-          } finally {
-            Object.values(out).forEach((t) => t.dispose());
-          }
+                job.settings.region,
+                job.boat.seats,
+              )
+            : null;
+          const boxes = predicted ?? (await detectFrame(source));
+          if (!predicted) markDetector(index, time);
+          const item = {
+            source,
+            time,
+            index,
+            boxes,
+            boxSource: predicted
+              ? ("predicted" as const)
+              : ("detected" as const),
+            detectorAge: predicted ? index - lastDetectorFrame : 0,
+          };
           // Staged mode blocks only once `capacity` frames are queued or in
           // flight, so a slow pose stage throttles the decoder instead of
           // growing memory; in-place mode simply awaits the work.
-          if (canOverlap()) await pipeline.push({ source, time, boxes });
-          else await processFrame({ source, time, boxes });
+          if (canOverlap()) await pipeline.push(item);
+          else await processFrame(item);
         } catch (e) {
           source.dispose();
           throw e;
@@ -877,8 +1071,18 @@ async function run(job: Job) {
       seconds,
       posePasses,
       posePassesSaved,
+      setupSeconds,
+      detectorRuns,
+      predictedFrames,
+      detectorRefreshes,
     });
     notes.push(`Performance: ${performance_.summary}`);
+    if (job.settings.detectorCadence === "auto")
+      notes.push(
+        predictedFrames
+          ? `Detector cadence reused pose-checked boxes on ${predictedFrames} frames. Their joints were still estimated from those frames, but seat identity confidence is reduced until fresh detection.`
+          : "Auto detector cadence kept full detection: pose or unstable crops outweighed safe detector reuse on this run.",
+      );
     send("progress", 0.98);
     const session: Session = {
       version: 1,
@@ -914,7 +1118,8 @@ async function run(job: Job) {
         "Catch/finish events are leg-compression proxies from thigh (hip-to-knee) elevation, not directly observed blade entry/release.",
         "3D camera normalization, oar tracking, and depth-dependent biomechanics are not validated and are withheld.",
       ],
-      model: `${job.detector.name} + ${job.pose.name}; ${job.settings.width}×${job.settings.height}; ${describeTta(job.settings.tta)}`,
+      poseJoints: job.settings.poseJoints,
+      model: `${job.detector.name} + ${job.pose.name}; ${job.settings.poseJoints}-joint ${job.settings.poseJoints === 17 ? "COCO body" : "COCO WholeBody"}; ${job.settings.width}×${job.settings.height}; ${describeTta(job.settings.tta)}; ${job.settings.detectorCadence === "auto" ? "guarded detector cadence" : "every-frame detection"}`,
       // Provider strings carry the adapter description when the GPU was used,
       // so an exported session records what actually ran where.
       provider: `${detectorLabel} detector / ${poseProvider} pose`,

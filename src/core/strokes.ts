@@ -390,3 +390,15 @@ export const mean = (values: (number | null)[]) => {
   );
   return valid.length ? valid.reduce((a, b) => a + b) / valid.length : null;
 };
+
+/** A crew average cannot stand for the crew when only one seat has evidence. */
+export function crewMean(
+  strokes: Stroke[],
+  seats: number,
+  value: (stroke: Stroke) => number | null,
+): number | null {
+  const valid = strokes.filter((stroke) => value(stroke) !== null);
+  if (new Set(valid.map((stroke) => stroke.seat)).size < Math.ceil(seats / 2))
+    return null;
+  return mean(valid.map(value));
+}

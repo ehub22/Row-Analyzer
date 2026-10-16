@@ -169,3 +169,43 @@ Both the dev server and the production bundle (`vite preview`) were exercised; t
 Added developer tooling (not shipped in the app bundle): `scripts/lib/chromium.mjs` launches a Chromium with the sandbox's bundled NSS/SwiftShader libraries (used by `smoke.mjs`, `worker-check.mjs`, `decode-check.mjs` and `gpu-analysis-check.mjs`), and `scripts/gpu-analysis-check.mjs` prints the provider, the session warnings, and every ONNX Runtime asset requested — the check that made this bug visible.
 
 **Still not validated:** real pretrained YOLOX/DWPose weights, real hardware GPUs and their drivers (this sandbox only offers a SwiftShader software adapter — accuracy and speed claims on real GPUs remain unmet), Safari and Firefox, GPU memory limits with 216 MB fp32 detector weights, and the mid-run device-loss recovery path (implemented, type-checked, and covered by design review only — no device-loss event was triggered in this environment).
+
+## Frame-preserving speed update — engineering checks (2026-10-15)
+
+The supplied private `5.mov` is a 25.298 s, 1920×1080 four-rower sculling quad with 759 encoded samples. Headless Chrome emitted **758** (the missing sample is reported, never invented). With four-person **constant ONNX test doubles**, adaptive TTA, force-WASM, the full detection region, and a four-worker pose pool:
+
+| Browser run | Analysis wall | Pose passes | Detector runs | Caveat |
+| --- | ---: | ---: | ---: | --- |
+| Full-frame bitmap dispatch, post-planner | 47.8 s | 3,032 | 758 | same four workers × four WASM threads |
+| Crop-sized bitmap transfers | 26.7–26.9 s | 3,032 | 758 | same models, clip, pool, and detector workload |
+
+That is a roughly **44% wall-time reduction for the pipeline fixture**, not a measured gain with pretrained weights. Experimental Auto detector cadence stayed in full-detection mode on this pose-bound fixture (zero predicted crops), so the saving came from limiting worker transfers to the pixels each pose crop needs, not from dropping detector or pose calls. Every-frame detection remains the default until identity and timing are checked with real weights and labels. The test-double graph returns constants independent of video pixels and cannot establish tracking accuracy or real-weight throughput. `PLAYWRIGHT_EXECUTABLE_PATH=/usr/bin/google-chrome VIDEO=5.mov node scripts/crop-equivalence-check.mjs` compared 50 actual decoded-frame pose tensors (five frames × five in-frame/edge crops × original/flipped); all values matched exactly between the original full-frame draw and the cropped-transfer draw. `npm test`: 135 passed, one skipped; `npm run build` and all eight production browser tests passed. The separate older `scripts/pose-perf-check.mjs` diagnostic returned nonzero on this Chrome: its full-frame **detector** VideoFrame-vs-bitmap comparison differs (maximum raw channel difference 127), while its pose-crop comparisons were zero. The new pose-only crop check above passed; the detector discrepancy needs separate investigation and is not evidence about the transferred pose crop. The Vite build still warns that the existing nonmodule `coi-serviceworker.js` tag cannot be bundled; the page serves it separately.
+
+The developer benchmark (`scripts/gpu-analysis-check.mjs`) exports the actual provider, decode/pose/detector counts, setup versus total wait, and stage timings. A physical NVIDIA device by itself does not prove Chrome selected hardware WebGPU; this headless test used WASM.
+
+## Provided-weight CPU profile and body-only mode (2026-10-15)
+
+The user added files named `yolox_l.onnx` (216,746,733 B) and `dw-ll_ucoco_384.onnx` (134,399,116 B). Their model provenance and rowing accuracy have **not** been independently authenticated. On a private 30-frame/1.0 s Quad excerpt from `5.mov`, with every-frame detection and four WASM pose workers × four threads, all runs decoded 30/30 frames and produced 120 seat-frames with no post-fix page errors. The initial pair granted the detector two WASM threads; the final Off run used one otherwise-idle CPU core to grant it three:
+
+| Supplied pair | Analysis wall | Detector infer/call | Pose infer/pass | Pose passes |
+| --- | ---: | ---: | ---: | ---: |
+| TTA Off · detector 2 threads | 55.2 s | 1,761 ms | 298 ms | 120 |
+| Adaptive · detector 2 threads | 62.0 s | 1,772 ms | 271 ms | 207 |
+| TTA Off · detector 3 threads | **40.7 s** | **1,274 ms** | 310 ms | 120 |
+
+Detector and pose stages **overlap**; their totals must not be added. Adaptive spent 87 more pose passes and 6.8 s more wall time than Off at the same two-thread detector setting. On this 20-logical-core CPU, giving the detector a spare third thread improved the matched Off excerpt from 55.2 to 40.7 s (about 26% faster); pose workers remained 4×4. Even then YOLOX-L detection costs about 1.27 s per frame, so replacing 133-joint pose with a smaller 17-joint model **cannot by itself** make the 758-frame clip finish under 60 s. A compatible much smaller detector is also needed; neither the full-clip provided-weight runtime nor a smaller-detector accuracy comparison has been measured. These are throughput findings, not validation of keypoints or seat identities.
+
+Earlier provided-weight attempts surfaced a real UI bug: the App closed the prior live-preview bitmap before React's Viewer draw effect could consume it, causing a detached-image exception and a blank workspace. Preview handles now close after replacement commits. The app accepts **separately imported COCO-17 ONNX** as an explicit mode; it decodes 17 joints and pads unavailable 17–132 as missing in the existing 133-slot sessions without fabricating hand/face/foot observations. Constant 17-joint SimCC and heatmap test doubles exercise the browser plumbing, not accuracy. At the user's request, official OpenMMLab RTMPose-t and Megvii YOLOX-Nano ONNX files were downloaded, checked and held in ignored private directories, never bundled or published. Neither archive/release declares separate weight-redistribution terms; the source-code licenses alone do not establish those rights.
+
+## Small-model full-clip throughput and evidence (2026-10-15)
+
+After URL-specific authorization for local graph execution, the four-rower `5.mov` was analyzed with YOLOX-Nano `[1,3,416,416] → [1,3549,85]` and RTMPose-t COCO-17 `[batch,3,256,192] → SimCC x/y`. Settings: every-frame detector, TTA **Off**, four WASM pose workers × four threads, detector three threads, feet declared hidden. Both runs emitted **758 of 759** encoded frames; no missing frame was invented. The runtime and model identities were recorded in the session, with 133 slots per frame and 116 unmodeled joints flagged missing.
+
+| Local browser | Analysis wall | Analyze-to-result | Pose passes | Detector calls | Outcome |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Bundled Chromium 153, headless | 49.4 s | **50.5 s** | 2,994 | 758 | complete, no page errors; two aborted blob requests and one nonfatal MP4Box warning |
+| System Chrome 155, headless | 34.7 s | **35.5 s** | 3,003 | 758 | complete, no page errors |
+
+The browser/launch environments differ, so these are not a controlled A/B speed comparison. Both meet the <60 s **throughput** target on this 20-logical-core CPU; neither establishes seat-ID, joint or stroke-event accuracy. A local review of the rendered skeletons showed approximate alignment to four rowers, but hip/knee confidence was insufficient for most timing metrics. Of 33 segmented seat-cycles in the Chrome run, only **one** yielded a nonwithheld rate (seat 2); the other seats yielded none. The crew-average rate is now withheld when fewer than half the seats contribute reliable cycles, rather than presenting a one-cycle estimate as a crew measurement. No labeled ground truth exists for this clip.
+
+On a separate 30-frame excerpt, Adaptive TTA dispatched 330 passes versus 120 with Off and improved visible body-joint coverage on several seats; a full-clip Adaptive run was **not** benchmarked and should not be assumed to fit under one minute. The models remain private local files; any redistribution would require verified weight terms.

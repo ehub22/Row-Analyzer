@@ -10,7 +10,7 @@ The app imports local `.onnx` files; it does not execute Python or send video to
 - Sapiens: https://github.com/facebookresearch/sapiens
 - YOLOX: https://github.com/Megvii-BaseDetection/YOLOX
 
-**Recommended initial browser evaluation pair:** YOLOX-L `yolox_l.onnx` plus DWPose `dw-ll_ucoco_384.onnx`. This is a practical whole-body baseline, not proof it is the most accurate rowing model. RTMW-x high-resolution and whole-body ViTPose large/huge should be benchmarked against it before selecting a production model. Do not substitute a COCO-17 body checkpoint.
+**Whole-body baseline pair:** YOLOX-L `yolox_l.onnx` plus DWPose `dw-ll_ucoco_384.onnx`. These supplied files have been run locally, but their provenance and rowing accuracy are not independently verified. A COCO-17 body checkpoint is now supported as a separate mode, not a substitute for 133-joint manual labeling needs. The [OpenMMLab RTMPose-t archive](https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/rtmpose-t_simcc-body7_pt-body7_420e-256x192-026a1439_20230504.zip) was safely extracted to an ignored local directory at the user's request and its ONNX I/O contract inspected. It is **not bundled, cached by default, or redistributed**: the archive carries no weight-license terms, and the [MMPose source license](https://github.com/open-mmlab/mmpose/blob/main/README.md) alone does not establish checkpoint redistribution rights. After URL-specific local approval, the small pose model and YOLOX-Nano processed the entire clip in under 60 s on the measured CPU/browser setups (see validation report). This is throughput, **not** joint, seat-identity or stroke-timing accuracy validation.
 
 ## Supported contracts
 
@@ -20,6 +20,7 @@ The app imports local `.onnx` files; it does not execute Python or send video to
 - Output `[1,N,85]`: raw grid-relative x/y and log-width/height, objectness and 80 class scores; person class index 0.
 - Strides 8/16/32; decode, confidence threshold 0.35, NMS IoU 0.45.
 - A graph with already-decoded coordinates is **not** compatible with this adapter.
+- A [YOLOX-Nano COCO ONNX](https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/yolox_nano.onnx) was downloaded to an ignored private directory for local evaluation. Static metadata shows `[1,3,416,416]` → `[1,3549,85]` with raw-grid output; this appears compatible with the adapter's size-derived grid decode and raw BGR/114 letterbox. After URL-specific local approval it ran successfully on the full clip with the COCO-17 model, though detection and pose accuracy are **not** benchmark-validated. No separate weight-license notice was found; it is not bundled or redistributed.
 
 ### YOLOv8 / YOLO11 (optional detector adapter)
 - RGB 0–1, square NCHW input, top-left letterbox.
@@ -27,15 +28,16 @@ The app imports local `.onnx` files; it does not execute Python or send video to
 - End-to-end `[1,N,6]` or YOLO26 exports are rejected.
 - Review Ultralytics licensing separately; weights are not bundled here.
 
-### DWPose / compatible RTMW SimCC
-- Input `[1,3,H,W]`; default **W=288, H=384**, RGB.
-- Mean `[123.675,116.28,103.53]`, standard deviation `[58.395,57.12,57.375]`.
-- Two outputs in x-then-y order: `[1,133,2W]`, `[1,133,2H]` (dimension-derived scale also supported).
-- COCO-WholeBody order: 17 body, 6 feet, 68 face, 21 left hand, 21 right hand. No inserted OpenPose neck.
-- Argmax plus local parabolic sub-pixel refinement. Confidence uses minimum axis peak clipped to [0,1], not a calibrated probability. Different SimCC training normalizations require empirical threshold calibration.
+### SimCC pose (COCO-17 body or COCO-WholeBody-133)
+- Select **Pose joint layout** explicitly: 133 remains the default; 17 requires a separately imported local trained COCO-17 ONNX file. The cached/downloadable DWPose whole-body weights are never used in body-only mode.
+- Input `[1,3,H,W]`; default whole-body **W=288, H=384**, while a compatible small body-only export may use **W=192, H=256**. Settings must match the actual graph.
+- RGB normalization: mean `[123.675,116.28,103.53]`, standard deviation `[58.395,57.12,57.375]`.
+- Two outputs in x-then-y order: `[1,J,Nx]`, `[1,J,Ny]`, with the same coordinate scale on both axes and **J=17 or 133 matching the selection**. Symbolic metadata is verified by an actual zero-input run before video decoding.
+- COCO-17 uses the same first 17 body indices as COCO-WholeBody-133, which adds 6 feet, 68 face, 21 left-hand and 21 right-hand joints. No inserted OpenPose neck or arbitrary 17-joint taxonomy.
+- Argmax plus local parabolic sub-pixel refinement. Confidence uses minimum axis peak clipped to [0,1], not a calibrated probability. Crop geometry, normalization and confidence require empirical validation for every new export. Taking the first 17 outputs of a 133-joint graph **does not speed up its backbone**.
 
-### Whole-body heatmap exports
-- Same image preprocessing; one `[1,133,Hh,Wh]` heatmap tensor.
+### Heatmap pose exports
+- Same image preprocessing; one `[1,J,Hh,Wh]` heatmap tensor with J matching the selected 17/133 layout.
 - Peak + local 2D parabolic refinement and inverse crop mapping.
 - The export must match the exact non-UDP coordinate convention. Generic ViTPose body checkpoints/UDP exports are not automatically compatible.
 - Current TTA fuses **decoded coordinates**, weighted by confidence, and penalizes inter-pass disagreement. It does **not** yet perform full heatmap-space multi-scale fusion or DARK refinement.
@@ -45,8 +47,12 @@ Two crop scales (1.25, 1.5) × original/flipped input. Preserve aspect ratio and
 
 The *Adaptive* policy (default) runs the first pass alone and accepts it when every gated body joint reaches 0.3 and the body mean reaches 0.5; otherwise the same four passes run and fuse. Joints the session declares hidden are not gated: with *Feet in view: Hidden by the hull* (the on-water default) that is the ankles, which no extra pass can reveal.
 
+### Detector cadence
+
+*Every frame* is the default for fresh person detection. Experimental *Auto* starts with full detection and only attempts to reuse short-lived crops when measured detector cost dominates pose, with an anchor at least every third decoded frame. The next frame's crop comes from a completed, confidence-gated seat pose; weak/ambiguous crops trigger fresh detection and a same-frame pose retry. Every decoded frame with a valid seat still runs inference with the selected pose model. A predicted **box** is not a fresh person observation: each frame records `boxSource` and `detectorAge`, and identity confidence is capped by that age. Existing sessions without those optional fields were made before cadence. *Every frame* restores full detection for comparisons. This policy is not validated for real-weight seat identity, hands or timing accuracy on rowing footage.
+
 ### Hidden feet
-On the water the feet (ankles 15–16, feet 17–22) are below the gunwale for the whole clip, so whatever the model returns for them is a guess. When the session declares them hidden, the worker replaces them with missing joints flagged *Feet hidden by the hull* before tracking, and stroke cycles use hips and knees only. A manually placed foot point is kept. Choose *Visible* for ergometer or overhead footage to track them like any other joint.
+On the water the feet (ankles 15–16, feet 17–22) are below the gunwale for the whole clip, so whatever the model returns for them is a guess. When the session declares them hidden, the worker replaces them with missing joints flagged *Feet hidden by the hull* before tracking, and stroke cycles use hips and knees only. A manually placed foot point is kept. Choose *Visible* for ergometer or overhead footage. A COCO-17 model may estimate visible ankles 15–16 but **never supplies toe/heel joints 17–22**, regardless of camera setup; those slots stay unavailable unless manually labeled.
 
 ## Automatic download and cache
 
@@ -56,6 +62,8 @@ Weights are **never** committed to Git or bundled in the Pages build (`*.onnx` i
 2. **Cache Storage** (`row-analyzer-models-v1`) — a previous successful download, re-validated for exact size and ONNX header; a corrupt entry is evicted.
 3. **Streamed download** from the configured URL, with a live progress bar. The file must match the expected byte length (and SHA-256 when configured) before it is cached.
 4. Otherwise an actionable error and the local-file import path.
+
+The automatic pose cache/download specification is **133-joint DWPose only**. In 17-joint mode a local, compatible COCO-17 file is mandatory; the cached whole-body model is never substituted. The session keeps 133 slots for backward-compatible exports, with 17–132 marked *not provided by model* unless manually labeled.
 
 Build-time configuration (repository **variables**, passed by the Pages workflow; not secrets):
 
@@ -69,7 +77,7 @@ Requirements for a download URL: HTTPS, CORS readable from the Pages origin (`Ac
 
 Downloaded data is model weights only. Video frames and keypoints are never cached. *Clear cached models* in the dialog removes them.
 
-Each ONNX session also runs a shape-level contract check when it is created (`src/core/compat.ts`): YOLOX `[1,N,85]` or YOLOv8/11 `[1,84,N]`, square detector input, DWPose input matching the configured width/height, and 133-joint SimCC or heatmap outputs. A failed check stops analysis before any frame is decoded. Passing this check confirms the I/O contract only, not accuracy.
+Each ONNX session also runs a shape-level contract check when it is created (`src/core/compat.ts`): YOLOX `[1,N,85]` or YOLOv8/11 `[1,84,N]`, square detector input, DWPose input matching the configured width/height, and the **selected 17- or 133-joint** SimCC/heatmap outputs. Symbolic metadata is confirmed with a zero-input inference before video decoding. A failed check stops analysis before any frame is decoded. Passing this check confirms the I/O contract only, not accuracy.
 
 ## Browser runtime
 
