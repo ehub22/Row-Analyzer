@@ -209,3 +209,21 @@ After URL-specific authorization for local graph execution, the four-rower `5.mo
 The browser/launch environments differ, so these are not a controlled A/B speed comparison. Both meet the <60 s **throughput** target on this 20-logical-core CPU; neither establishes seat-ID, joint or stroke-event accuracy. A local review of the rendered skeletons showed approximate alignment to four rowers, but hip/knee confidence was insufficient for most timing metrics. Of 33 segmented seat-cycles in the Chrome run, only **one** yielded a nonwithheld rate (seat 2); the other seats yielded none. The crew-average rate is now withheld when fewer than half the seats contribute reliable cycles, rather than presenting a one-cycle estimate as a crew measurement. No labeled ground truth exists for this clip.
 
 On a separate 30-frame excerpt, Adaptive TTA dispatched 330 passes versus 120 with Off and improved visible body-joint coverage on several seats; a full-clip Adaptive run was **not** benchmarked and should not be assumed to fit under one minute. The models remain private local files; any redistribution would require verified weight terms.
+
+## Camera normalization mechanism (synthetic, not wired to the workbench)
+
+`src/core/horizon.ts` locks the horizon from pixels by gradient-weighted Hough voting over near-horizontal lines. Votes from several frames of a static camera are summed, so the horizon accumulates while moving clutter does not. `src/core/camera3d.ts` then solves the camera from that horizon and the bow/stern line:
+
+- **Roll** comes from the horizon direction alone, with no focal length.
+- **Pitch** and **azimuth** need a focal length, either supplied or self-calibrated from the shell axis and a vertical line family (Caprile–Torre). Azimuth 0° is side-on, 90° is bow/stern-on.
+- **Body angles** (trunk from vertical, hip, knee, elbow, thigh and shin from horizontal) are measured in the rower's sagittal plane. Each image point is mapped to that plane by its camera ray, so no depth is needed.
+
+Gates withhold output rather than estimate it: roll above 30°, pitch above 45°, azimuth 60° or more, an ambiguous bow direction, an unknown or implausible focal length, or horizon confidence below 0.3. The output is labelled plane-normalized and not validated.
+
+Measured on the synthetic rig (1280×720, f = 1000 px, rower in the sagittal plane):
+
+- Roll, pitch, azimuth and trunk, hip, knee and elbow angles all recover to numerical precision at azimuths 0–55°. A constant lateral offset of the whole body has no effect, since the body stays on one plane.
+- **Arms reaching out of the plane are the dominant error.** Without a gate, an elbow 0.15 m out gives 6.7° error side-on and −40° at 55°; 0.3 m gives 17° and −65°. The image cannot see this motion. The foreshortening gate withholds the elbow when its upper arm or forearm is below 92% of its clip-wide in-plane length (95th percentile). It does not catch out-of-plane motion that happens to keep the segment at full length.
+- Horizon detection locks a synthetic horizon to under 0.2° and about 1 px, with clutter, noise, and moving blobs. Pure noise and featureless frames are rejected.
+
+**Not validated:** real footage, real horizons (the far bank or water line is often absent), real lens distortion, bow-stern lines that are not level, and the 3D depth error of the sagittal approximation. Nothing in the workbench shows these angles yet.
