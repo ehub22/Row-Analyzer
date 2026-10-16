@@ -43,9 +43,11 @@ export interface TensorPoseJob extends PoseJobBase {
 }
 
 export interface BitmapPoseJob extends PoseJobBase {
-  /** Frame bitmap; serialized per worker unless `transfer` is set. */
+  /** Frame bitmap or a pixel-identical subrectangle transferred to the worker. */
   bitmap: ImageBitmap;
   transfer: boolean;
+  /** Crop coordinates in bitmap space; `crop` remains in full-frame space for decoding. */
+  rasterCrop?: Box;
 }
 
 export type PoseJob = TensorPoseJob | BitmapPoseJob;
@@ -88,9 +90,7 @@ const toError = (v: unknown): Error =>
 
 /** Chrome's list of transferable types, checked without assuming ImageBitmap. */
 function isTransferable(value: unknown): value is Transferable {
-  return (
-    typeof ImageBitmap !== "undefined" && value instanceof ImageBitmap
-  );
+  return typeof ImageBitmap !== "undefined" && value instanceof ImageBitmap;
 }
 
 export class PoseWorkerPool {
@@ -99,6 +99,7 @@ export class PoseWorkerPool {
   private pending = new Map<number, Pending>();
   private inflight: number[];
   private nextId = 1;
+  private expectedJoints: 17 | 133 | null = null;
   private disposed = false;
   private readyWaiters: {
     resolve: () => void;
@@ -134,6 +135,8 @@ export class PoseWorkerPool {
 
   /** Sends the init payload to every endpoint. Call exactly once. */
   init(payload: Record<string, unknown>): void {
+    if (payload.joints === 17 || payload.joints === 133)
+      this.expectedJoints = payload.joints;
     this.endpoints.forEach((ep, i) => {
       try {
         ep.send({ type: "init", ...payload });
@@ -182,6 +185,7 @@ export class PoseWorkerPool {
             id,
             bitmap: bitmapJob.bitmap,
             crop: job.crop,
+            rasterCrop: bitmapJob.rasterCrop,
             flip: job.flip,
             format: job.format,
           }
@@ -194,10 +198,9 @@ export class PoseWorkerPool {
             flip: job.flip,
             format: job.format,
           };
-      // A bitmap is serialized as a lightweight handle to the same pixels, so
-      // the coordinator keeps its own handle and every worker gets a reference
-      // instead of a pixel copy. A tensor buffer is transferred: zero-copy, and
-      // the caller must build a fresh tensor per concurrent pass anyway.
+      // A newly created bitmap handle is transferred without cloning pixels;
+      // serializing the original without transfer remains a compatibility
+      // fallback. Tensor buffers are transferred as well.
       const transfer: Transferable[] = bitmapJob
         ? bitmapJob.transfer && isTransferable(bitmapJob.bitmap)
           ? [bitmapJob.bitmap]
@@ -220,12 +223,22 @@ export class PoseWorkerPool {
     const msg = message as {
       type?: string;
       id?: number;
+      joints?: number;
       points?: Point[];
       timings?: PassTimings;
       error?: unknown;
     };
     if (msg.type === "ready") {
       if (!s.dead) {
+        if (this.expectedJoints && msg.joints !== this.expectedJoints) {
+          this.markDead(
+            index,
+            new Error(
+              `Pose worker reported ${msg.joints ?? "unknown"} joints; expected ${this.expectedJoints}.`,
+            ),
+          );
+          return;
+        }
         s.ready = true;
         this.settleReadyWaiters();
       }
@@ -238,7 +251,8 @@ export class PoseWorkerPool {
       return;
     }
     if (msg.type === "pose-result" || msg.type === "pose-error") {
-      const p = typeof msg.id === "number" ? this.pending.get(msg.id) : undefined;
+      const p =
+        typeof msg.id === "number" ? this.pending.get(msg.id) : undefined;
       if (!p || p.endpoint !== index) return;
       this.pending.delete(msg.id!);
       this.inflight[index]--;
@@ -303,7 +317,9 @@ export class PoseWorkerPool {
       const first = this.state.find((s) => s.error)?.error;
       for (const w of this.readyWaiters.splice(0))
         w.reject(
-          new Error(`All pose workers failed to start: ${first ?? "unknown error"}`),
+          new Error(
+            `All pose workers failed to start: ${first ?? "unknown error"}`,
+          ),
         );
     }
   }

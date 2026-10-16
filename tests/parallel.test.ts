@@ -27,7 +27,11 @@ describe("planParallelism", () => {
 
   it("grants real WASM threads only with isolation AND SharedArrayBuffer", () => {
     const isolated = planParallelism(
-      env({ crossOriginIsolated: true, sharedArrayBuffer: true }),
+      env({
+        hardwareConcurrency: 12,
+        crossOriginIsolated: true,
+        sharedArrayBuffer: true,
+      }),
     );
     expect(isolated.wasmThreads).toBeGreaterThan(1);
     expect(planThreadBudget(isolated)).toBeLessThanOrEqual(
@@ -37,9 +41,9 @@ describe("planParallelism", () => {
     expect(
       planParallelism(env({ crossOriginIsolated: true })).wasmThreads,
     ).toBe(1);
-    expect(
-      planParallelism(env({ sharedArrayBuffer: true })).wasmThreads,
-    ).toBe(1);
+    expect(planParallelism(env({ sharedArrayBuffer: true })).wasmThreads).toBe(
+      1,
+    );
   });
 
   it("splits the core budget across the pool instead of oversubscribing", () => {
@@ -52,11 +56,28 @@ describe("planParallelism", () => {
       2,
     );
     expect(plan.poseWorkers).toBe(2);
-    expect(plan.wasmThreads).toBe(4);
-    expect(planThreadBudget(plan)).toBe(8);
+    expect(plan.wasmThreads).toBe(3);
+    expect(plan.detectorThreads).toBe(2);
+    expect(planThreadBudget(plan) + plan.detectorThreads).toBeLessThanOrEqual(
+      8,
+    );
   });
 
-  it("a single explicit worker on an isolated page gets the whole budget", () => {
+  it("uses spare cores for detection on a large isolated CPU", () => {
+    const plan = planParallelism(
+      env({
+        hardwareConcurrency: 20,
+        crossOriginIsolated: true,
+        sharedArrayBuffer: true,
+      }),
+    );
+    expect(plan.poseWorkers).toBe(4);
+    expect(plan.wasmThreads).toBe(4);
+    expect(plan.detectorThreads).toBe(3);
+    expect(planThreadBudget(plan) + plan.detectorThreads).toBeLessThan(20);
+  });
+
+  it("a single explicit worker reserves capacity for decoding and detection", () => {
     const plan = planParallelism(
       env({
         hardwareConcurrency: 8,
@@ -66,14 +87,23 @@ describe("planParallelism", () => {
       1,
     );
     expect(plan.poseWorkers).toBe(1);
-    expect(plan.wasmThreads).toBe(8);
+    expect(plan.wasmThreads).toBe(6);
+    expect(planThreadBudget(plan) + plan.detectorThreads).toBe(8);
   });
 
   it("auto sizing leaves a core for decode/UI and caps model duplication", () => {
-    expect(planParallelism(env({ hardwareConcurrency: 16 })).poseWorkers).toBe(4);
-    expect(planParallelism(env({ hardwareConcurrency: 4 })).poseWorkers).toBe(3);
-    expect(planParallelism(env({ hardwareConcurrency: 2 })).poseWorkers).toBe(1);
-    expect(planParallelism(env({ hardwareConcurrency: 1 })).poseWorkers).toBe(1);
+    expect(planParallelism(env({ hardwareConcurrency: 16 })).poseWorkers).toBe(
+      4,
+    );
+    expect(planParallelism(env({ hardwareConcurrency: 4 })).poseWorkers).toBe(
+      3,
+    );
+    expect(planParallelism(env({ hardwareConcurrency: 2 })).poseWorkers).toBe(
+      1,
+    );
+    expect(planParallelism(env({ hardwareConcurrency: 1 })).poseWorkers).toBe(
+      1,
+    );
   });
 
   it("clamps explicit requests and tolerates bogus core counts", () => {

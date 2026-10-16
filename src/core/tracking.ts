@@ -5,14 +5,25 @@ interface Track {
   box: Box;
   missed: number;
 }
+export interface TrackedDetection {
+  box: Box;
+  points: Point[];
+  boxSource?: "detected" | "predicted";
+  detectorAge?: number;
+}
 // Exact global assignment for <=8 seats using bitmask DP over candidate detections.
 export class SeatTracker {
   private tracks: Track[] = [];
   constructor(private boat: Boat) {}
-  update(
-    detections: { box: Box; points: Point[] }[],
-    time: number,
-  ): PoseFrame[] {
+
+  /** Check a proposed assignment without advancing any track. */
+  preview(detections: TrackedDetection[], time: number): PoseFrame[] {
+    const copy = new SeatTracker(this.boat);
+    copy.tracks = this.tracks.map((t) => ({ ...t, box: { ...t.box } }));
+    return copy.update(detections, time);
+  }
+
+  update(detections: TrackedDetection[], time: number): PoseFrame[] {
     if (!this.tracks.length) {
       const sorted = [...detections].sort(
         (a, b) => (a.box.x - b.box.x) * (this.boat.bowLeft ? 1 : -1),
@@ -78,12 +89,20 @@ export class SeatTracker {
       const c = cost(t, d);
       t.box = d.box;
       t.missed = 0;
+      const age = d.boxSource === "predicted" ? (d.detectorAge ?? 1) : 0;
       return {
         time,
         seat: t.seat,
         box: d.box,
         points: d.points,
-        identityConfidence: Math.max(0, 1 - c),
+        boxSource: d.boxSource ?? "detected",
+        detectorAge: age,
+        // Reusing a box has no displacement cost, but is not a fresh identity
+        // observation. Never let zero motion manufacture certainty.
+        identityConfidence: Math.min(
+          Math.max(0, 1 - c),
+          age ? Math.max(0, 0.9 - age * 0.15) : 1,
+        ),
       };
     });
   }

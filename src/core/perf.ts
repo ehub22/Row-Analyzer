@@ -11,7 +11,8 @@
 // Stage names are dotted: the prefix is the top-level stage shown as a share of
 // wall time, the rest is a per-pass average ("pose.infer" → "pose 61% · infer
 // 84 ms/pass"). Worker-side stages are summed across workers, so they are
-// reported per call rather than as a share of the wall clock.
+// reported per call rather than as a share of wall time. `pose.pass` is the
+// coordinator's dispatch-to-result time, including worker transit and queuing.
 
 export interface StageTiming {
   stage: string;
@@ -28,6 +29,13 @@ export interface PerformanceReport {
   posePasses: number;
   /** Passes the adaptive TTA gate skipped compared with `always`. */
   posePassesSaved: number;
+  /** Model/session startup, before the analysis timer starts. */
+  setupSeconds?: number;
+  /** Analyze click to result, including model resolution and startup. */
+  totalSeconds?: number;
+  detectorRuns?: number;
+  predictedFrames?: number;
+  detectorRefreshes?: number;
   stages: StageTiming[];
   /** One-line human summary, also shown in the workspace. */
   summary: string;
@@ -105,6 +113,7 @@ const pct = (part: number, whole: number) =>
  * CPU time, not the run. Their averages answer "inference or preprocessing?".
  */
 const PER_PASS_STAGES = [
+  "pose.pass",
   "pose.infer",
   "pose.preprocess",
   "pose.decode",
@@ -136,7 +145,27 @@ export function formatReport(report: PerformanceReport): string {
           : ""
       }`
     : "";
-  return [total + speed, ...parts, ...shared, passes.trim().replace(/^· /, "")]
+  const detection =
+    report.detectorRuns === undefined
+      ? ""
+      : `${report.detectorRuns} detector runs, ${report.predictedFrames ?? 0} frames with predicted boxes, ${report.detectorRefreshes ?? 0} refreshes`;
+  const setup =
+    report.setupSeconds === undefined
+      ? ""
+      : `model setup ${report.setupSeconds.toFixed(1)} s`;
+  const elapsed =
+    report.totalSeconds === undefined
+      ? ""
+      : `total from Analyze ${report.totalSeconds.toFixed(1)} s`;
+  return [
+    total + speed,
+    ...parts,
+    ...shared,
+    passes.trim().replace(/^· /, ""),
+    detection,
+    setup,
+    elapsed,
+  ]
     .filter(Boolean)
     .join(" · ");
 }
@@ -147,6 +176,10 @@ export interface ReportInput {
   seconds: number;
   posePasses?: number;
   posePassesSaved?: number;
+  setupSeconds?: number;
+  detectorRuns?: number;
+  predictedFrames?: number;
+  detectorRefreshes?: number;
 }
 
 export function buildReport(
@@ -159,6 +192,10 @@ export function buildReport(
     fps: input.seconds > 0 ? input.frames / input.seconds : 0,
     posePasses: input.posePasses ?? 0,
     posePassesSaved: input.posePassesSaved ?? 0,
+    setupSeconds: input.setupSeconds,
+    detectorRuns: input.detectorRuns,
+    predictedFrames: input.predictedFrames,
+    detectorRefreshes: input.detectorRefreshes,
     stages: timer.snapshot(),
     summary: "",
   };

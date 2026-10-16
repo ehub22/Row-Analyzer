@@ -167,10 +167,15 @@ detector barely move, which the report now makes visible instead of guessable.
 
 Still open, in rough order of expected value on CPU-only machines:
 
-- **Detector cadence.** The detector runs once per frame at 640×640 and is
-  frequently the largest stage in the report. Detecting every Nth frame and
-  posing from tracked boxes needs identity confidence to be redefined for
-  predicted boxes, so it is a design change, not a setting.
+- **Detector cadence (implemented as guarded Auto, not unconditional skipping).**
+  The run starts with full detection, then reuses a pose-checked crop for at
+  most two decoded frames only if measured detector cost exceeds the overlap
+  it gives up. Each valid seat still gets pose inference from every decoded
+  frame; weak or ambiguous predictions refresh detection and pose on the same
+  frame before tracking commits. Predicted crop positions carry provenance and
+  lower identity confidence; Every-frame remains the default baseline until
+  real-weight identity and timing checks validate the experimental Auto mode.
+  Accuracy and real-model speed on labeled rowing clips remain unvalidated.
 - **Real-weight measurements.** Every number above is CPU-side pipeline cost with
   constant test doubles; relative weight of inference still needs a maintainer
   machine with real DWPose/RTMW weights, which the build sandbox cannot fetch.

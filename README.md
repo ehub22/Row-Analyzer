@@ -11,8 +11,8 @@ A private, offline rowing-video review workbench for desktop Chrome. **Research 
 
 - Local MP4/MOV upload and native playback, slow motion, scrubbing, decoded-timestamp frame stepping after analysis.
 - WebCodecs + MP4Box decoder, worker/OffscreenCanvas preprocessing, bounded decoded-frame queue, progress and cancellation.
-- Browser ONNX Runtime Web pipeline: **WebGPU now actually runs.** The previous build pinned the wrong ONNX Runtime WASM module for the WebGPU entry point, so every GPU session failed on every device and browser with `webgpuInit is not a function` and silently fell back to CPU. The runtime now pins the WASM build each entry point was compiled against, probes the adapter before touching a model, and hands the probed adapter to ONNX Runtime. Every WebGPU session still has to pass a warm-up inference before decoding starts, and when the GPU is unavailable (or dies mid-run: device lost, driver reset) the analysis continues on the **parallel WASM pose-worker pool** with the exact reason recorded — no silent fallback. The workspace and every export show which runtime ran, e.g. `WebGPU (apple · metal-3) detector / WebGPU pose`. Threaded WASM additionally activates when the page is cross-origin isolated (COOP/COEP; the bundled service worker enables this on GitHub Pages). **Requires separately imported authentic detector and whole-body model weights.**
-- Top-down YOLOX / YOLOv8/11 detector adapters, aspect-correct padded crops, 133-joint SimCC or heatmap pose adapters, sub-pixel decoding, four-pass flip/multi-scale coordinate fusion.
+- Browser ONNX Runtime Web pipeline: **WebGPU now actually runs.** The previous build pinned the wrong ONNX Runtime WASM module for the WebGPU entry point, so every GPU session failed on every device and browser with `webgpuInit is not a function` and silently fell back to CPU. The runtime now pins the WASM build each entry point was compiled against, probes the adapter before touching a model, and hands the probed adapter to ONNX Runtime. Every WebGPU session still has to pass a warm-up inference before decoding starts, and when the GPU is unavailable (or dies mid-run: device lost, driver reset) the analysis continues on the **parallel WASM pose-worker pool** with the exact reason recorded — no silent fallback. The workspace and every export show which runtime ran, e.g. `WebGPU (apple · metal-3) detector / WebGPU pose`. Threaded WASM additionally activates when the page is cross-origin isolated (COOP/COEP; the bundled service worker enables this on GitHub Pages). **Requires compatible detector and pose ONNX weights; the build does not bundle them.**
+- Top-down YOLOX / YOLOv8/11 detector adapters, aspect-correct padded crops, COCO-17 body-only or COCO-WholeBody-133 SimCC/heatmap pose adapters, sub-pixel decoding, four-pass flip/multi-scale coordinate fusion. Body-only runs retain 133 session slots but mark unmodeled joints missing, never observed.
 - Global seat assignment with ambiguity gates; short bidirectional gap filling; observed/inferred/manual/missing provenance; low-confidence jump rejection.
 - Per-seat and crew review; catch/finish **body-motion proxies** from thigh (hip-to-knee) elevation, stroke rate, drive-to-recovery ratio, crew timing in milliseconds and phase degrees.
 - **Hidden feet are handled as expected occlusion.** On the water the feet are strapped to the stretcher below the gunwale, so a whole-body model can only guess them. With *Feet in view: Hidden by the hull* (the default) those guesses are discarded instead of tracked: stroke cycles are timed from hips and knees, which stay above the gunwale; the adaptive TTA gate stops paying four passes per crop for joints no pass can reveal; and when the knees also drop behind the hull with the legs flat, the cycle is bridged rather than lost. Choose *Visible* for ergometer or overhead footage.
@@ -23,7 +23,7 @@ A private, offline rowing-video review workbench for desktop Chrome. **Research 
 
 Automatic multi-cue camera azimuth, motion-compensated boat geometry, temporal 3D lifting, calibrated viewpoint-normalized biomechanics, blade/handle/oar detection, learned rowing-specific occlusion completion, reliable sequencing diagnoses, normalized 3D/model-stroke comparison, and a GPU companion are **not implemented**. Associated metrics are withheld, not simulated.
 
-Real pretrained weights could not be retrieved in the build environment because model hosts are outside its network allowlist. Browser inference was exercised with **constant test doubles**, not trained models. No rowing PCK/OKS, seat-identity accuracy, or calibrated angle accuracy is claimed. Read the validation report before using this as coaching evidence.
+The user-supplied `yolox_l.onnx` and `dw-ll_ucoco_384.onnx` were exercised locally on a short clip. Their checkpoint provenance and tracking accuracy are not independently verified; constant test doubles still underpin the pipeline regression tests. A smaller, genuinely trained COCO-17 ONNX is required for any body-only speed comparison—slicing the output of the existing 133-joint model does not speed its backbone. No rowing PCK/OKS, seat-identity accuracy, or calibrated angle accuracy is claimed. Read the validation report before using this as coaching evidence.
 
 ## Run locally
 
@@ -44,7 +44,7 @@ npm run test:e2e       # production-browser workflow tests
 ## Use
 
 1. Import a short MP4/MOV clip (up to 300 MB, 20,000 decoded-frame guard). Choose the shell, rigging, seat count, best-visible seat, and bow direction in the image.
-2. Open **Models & settings**. When the build has model URLs configured, the detector and whole-body models download automatically on the first analysis (with progress) and are cached in this browser. Otherwise import compatible ONNX files from your device. Set input dimensions/format to match the export. **Test-time augmentation** chooses how many whole-body inferences one crop gets: *Adaptive* (default) runs the single pass first and spends the other three — second scale plus both flips — only where that pass left a body joint below 0.3, *Always* pays four passes on every crop, *Off* pays one. **Parallel pose workers** controls how many CPU workers share those passes (Auto is right for most machines; each extra worker loads another copy of the pose model).
+2. Open **Models & settings**. When the build has model URLs configured, the detector and whole-body models download automatically on the first analysis (with progress) and are cached in this browser. Otherwise import compatible ONNX files from your device. Set **Pose joint layout** to 133 (default) or 17 and match input dimensions/format to the export. Body-only mode requires a separate local COCO-17 model: cached 133-joint weights are never silently used. **Test-time augmentation** chooses how many pose inferences one crop gets: *Adaptive* (default) runs the single pass first and spends the other three — second scale plus both flips — only where that pass left a body joint below 0.3, *Always* pays four passes on every crop, *Off* pays one. **Parallel pose workers** controls how many CPU workers share those passes (Auto is right for most machines; each extra worker loads another copy of the pose model). **Detector cadence** defaults to *Every frame* for a fresh person detection on each frame. Experimental *Auto* begins the same way and reuses a guarded crop for at most two frames only when measured detector time justifies it; every decoded frame with a viable seat still gets a fresh pose inference. Validate identities before relying on the experimental mode.
 3. If needed, use the detection-region percentage bounds to exclude bystanders/coxswain detection centers. This is a static region; the crew must stay inside it.
 4. Analyze. All decoded frames are submitted. Initialization stops if detected people do not match configured seats, rather than silently assigning incorrect identities.
 5. Verify identity, observations, and occlusion. Use **Keyframe labels** to correct only visible joints. Select a joint and click to add a missing observation, or drag an existing point.
@@ -70,7 +70,9 @@ worker pool the two stages run at the same time. `ms/pass` figures are measured
 per pass (in the pose workers for `pose.*`), which is what tells inference apart
 from preprocessing.
 
-Levers, roughly in order of effect:
+On a 30-frame Quad excerpt of `5.mov` with the provided YOLOX-L/DWPose-L files and four CPU pose workers, **TTA Off took 55.2 s** and Adaptive took 62.0 s with a two-thread detector. Assigning an otherwise idle core to the detector reduced the matched Off run to **40.7 s** (three detector threads, same 4×4 pose pool). YOLOX-L detector inference still averaged **1.27 s per frame**, while pose inference averaged about 0.31 s per pass. These are local provided-weight throughput measurements, not tracking accuracy or a full-clip timing claim. A 17-joint pose model by itself cannot bring this detector under a minute for the 758-frame clip; a compatible smaller detector is also needed. No alternative trained weights are bundled here. After local authorization, the privately downloaded YOLOX-Nano + RTMPose-t COCO-17 pair processed the full clip in **50.5 s** from Analyze to result on bundled Chromium 153, and **35.5 s** on system Chrome 155, both using CPU/WASM, every-frame detection and TTA Off. Browser versions differ, so these are not a controlled A/B. The speed target is met on this machine, but tracking quality remains unvalidated: only one of 33 segmented seat-cycles yielded a reliable nonwithheld rate. The UI withholds a crew average when fewer than half its seats supply reliable cycles.
+
+Levers to test against your run's stage report (the supplied large-model pair is detector-bound):
 
 1. **Test-time augmentation.** Four passes per crop is four whole-body
    inferences. Adaptive (the default) runs one pass first and only pays for the
@@ -88,12 +90,14 @@ Levers, roughly in order of effect:
    384×288, and a medium checkpoint costs a fraction of a large one. The
    settings must match the export exactly, and the contract check fails fast if
    they do not.
-4. **The detector, when the report says so.** On CPU-only machines the detector
-   often dominates: it runs once per frame at its own resolution, and a
-   `yolox_tiny`/`yolov8n` export can be several times cheaper than the large
-   ones. Running the detector on a cadence and posing from tracked boxes is
-   *not* implemented — it changes what identity confidence means, and that is a
-   roadmap item, not a hidden setting.
+4. **The detector, when the report says so.** Experimental Auto cadence begins
+   with full detection and only reuses a short-lived crop when detector time is
+   high relative to pose time. It refreshes on weak, missing, ambiguous or drifting
+   poses, with a new detector run at least every third frame. Joints still come
+   from the current frame; predicted crop positions are not fresh detections
+   and reduce seat-identity confidence. On a pose-bound run it deliberately
+   keeps detecting every frame. *Every frame* is the default baseline;
+   a compatible smaller detector may help if the detector remains the bottleneck.
 5. **Fewer pixels of crew.** The detection-region bounds and the boat's seat
    count decide how many crops exist at all; a single scull is one crop per
    frame, an eight is eight.
@@ -105,13 +109,15 @@ startup — the performance line reports only the analysis itself.
 Two implementation choices are what made the pose stage cheap, and both are
 verified rather than assumed:
 
-- **One bitmap per frame.** Drawing a decoded `VideoFrame` into a canvas costs a
-  readback that does not shrink with the crop (measured at 288×384:
-  ~23 ms per pass against ~7 ms from the frame's shared `ImageBitmap`, on a
-  2-core container with a software rasteriser). The frame is converted once and
-  every crop, TTA pass and preview draws from it — and `scripts/pose-perf-check.mjs`
-  asserts the tensors are *bit-identical* to the old per-pass path, so this
-  changes speed only, never what the model sees.
+- **One source bitmap, crop-sized transfers.** Drawing a decoded `VideoFrame`
+  repeatedly into a canvas costs a full-frame readback even for a small crop.
+  The detector and preview share one bitmap; each pose pass transfers only the
+  bounded image region it needs to its worker. The original full-frame crop
+  coordinates are retained for keypoint decoding. On `5.mov`,
+  `node scripts/crop-equivalence-check.mjs` compares 50 real-frame pose tensors
+  (including flips and edge crops) against the full-frame path: all floats
+  matched exactly. Transferring *full-frame* bitmap clones was slower on this
+  clip and is not used.
 - **Crops are rasterised in the workers.** Each pose worker draws and normalises
   its own crop from that bitmap into a reused buffer. Previously rasterisation
   happened serially on the coordinator while every pooled worker waited for

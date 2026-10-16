@@ -1,4 +1,5 @@
 import type { Boat, PoseFrame, Correction, Point } from "./types";
+export { MODEL_UNAVAILABLE_FLAG } from "./bodyLayout";
 
 // Expected occlusion.
 //
@@ -49,7 +50,7 @@ export function suppressHiddenJoints(
       y: 0,
       confidence: 0,
       origin: "missing",
-      flags: [HIDDEN_FEET_FLAG],
+      flags: [...new Set([...(out[j].flags ?? []), HIDDEN_FEET_FLAG])],
     };
   }
   return out;

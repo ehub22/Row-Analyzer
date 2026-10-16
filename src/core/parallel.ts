@@ -30,8 +30,8 @@ export interface ParallelPlan extends ParallelEnv {
   poseWorkers: number;
   /** WASM threads granted to each pose session. 1 unless isolated. */
   wasmThreads: number;
-  /** WASM threads granted to the detector session (runs while the pose pool
-   * is idle, so it may use more of the machine). 1 unless isolated. */
+  /** WASM threads granted to the detector session; it may overlap pose work.
+   * 1 unless isolated. */
   detectorThreads: number;
   /** True when the user picked the worker count explicitly. */
   workersExplicit: boolean;
@@ -87,12 +87,21 @@ export function planParallelism(
     ? clampInt(requestedWorkers, 1, MAX_POSE_WORKERS)
     : auto;
 
-  // Split the core budget across the pool; never grant threads the page
-  // cannot actually use, and never claim more threads than exist.
+  // Detection and pose overlap on separate workers. Leave a core for decode/UI
+  // and, on larger machines, one for the detector instead of granting every
+  // logical core to pose and then oversubscribing it with detector threads.
+  const reserve = cores >= 8 ? 2 : cores > 1 ? 1 : 0;
   const wasmThreads = threaded
-    ? clampInt(Math.floor(cores / poseWorkers), 1, cores)
+    ? clampInt(Math.floor((cores - reserve) / poseWorkers), 1, cores)
     : 1;
-  const detectorThreads = threaded ? clampInt(cores, 1, 4) : 1;
+  // Integer division can leave extra cores idle on large machines (20 cores,
+  // 4 workers × 4 threads leaves four). Give the detector those spare cores
+  // while retaining one for decode and UI instead of slowing every frame.
+  const detectorThreads = threaded
+    ? cores >= 16
+      ? clampInt(cores - poseWorkers * wasmThreads - 1, 1, 4)
+      : clampInt(reserve, 1, 4)
+    : 1;
 
   return {
     hardwareConcurrency: cores,
@@ -120,5 +129,5 @@ export function summarizePlan(plan: ParallelPlan): string {
     plan.wasmThreads === 1
       ? "1 WASM thread each"
       : `${plan.wasmThreads} WASM threads each`;
-  return `${workerPart} × ${threadPart} · ${plan.hardwareConcurrency} logical cores · cross-origin isolation ${plan.crossOriginIsolated ? "on" : "off"}`;
+  return `${workerPart} × ${threadPart} · detector ${plan.detectorThreads} WASM thread${plan.detectorThreads === 1 ? "" : "s"} · ${plan.hardwareConcurrency} logical cores · cross-origin isolation ${plan.crossOriginIsolated ? "on" : "off"}`;
 }

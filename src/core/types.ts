@@ -37,6 +37,10 @@ export interface PoseFrame {
   points: Point[];
   box: Box;
   identityConfidence: number;
+  /** Pose is measured on this frame; the crop itself may come from a prior frame. */
+  boxSource?: "detected" | "predicted";
+  /** Number of decoded frames since the last detector inference for this crop. */
+  detectorAge?: number;
 }
 export interface Boat {
   name: string;
@@ -103,6 +107,8 @@ export interface Session {
   warnings: string[];
   model: string;
   provider: string;
+  /** Actual pose-model output layout; older sessions used 133. */
+  poseJoints?: 17 | 133;
   /** Where the run's time went (see core/perf.ts); absent on imports from
    * builds that predate it. */
   performance?: PerformanceReport;
@@ -110,11 +116,15 @@ export interface Session {
 export interface ModelSettings {
   detector: "yolox" | "yolo";
   format: "simcc" | "heatmap";
+  /** COCO body-only or COCO WholeBody output layout. */
+  poseJoints: 17 | 133;
   width: number;
   height: number;
   /** Test-time augmentation policy: one pass, a cascaded adaptive plan, or
    * the full four-pass fusion (see core/tta.ts). */
   tta: TtaMode;
+  /** Auto may reuse guarded crops between detector anchors; every-frame is the baseline. */
+  detectorCadence: "auto" | "every-frame";
   wasm: boolean;
   /** Parallel pose workers. 0 = automatic (see core/parallel.ts); 1–8 = fixed.
    * Each worker owns its own pose-model session, so more workers use more RAM. */
@@ -124,9 +134,11 @@ export interface ModelSettings {
 export const defaultModels: ModelSettings = {
   detector: "yolox",
   format: "simcc",
+  poseJoints: 133,
   width: 288,
   height: 384,
   tta: "adaptive",
+  detectorCadence: "every-frame",
   wasm: false,
   workers: 0,
   region: { left: 0, top: 0, right: 100, bottom: 100 },

@@ -84,6 +84,23 @@ describe("formatReport", () => {
     expect(built.summary).toContain("decode wait 90%");
   });
 
+  it("distinguishes detector savings and startup from analysis time", () => {
+    const built = buildReport(new StageTimer(), {
+      frames: 100,
+      seconds: 7,
+      setupSeconds: 2,
+      detectorRuns: 40,
+      predictedFrames: 60,
+      detectorRefreshes: 2,
+    });
+    built.totalSeconds = 10;
+    expect(formatReport(built)).toContain(
+      "40 detector runs, 60 frames with predicted boxes, 2 refreshes",
+    );
+    expect(formatReport(built)).toContain("model setup 2.0 s");
+    expect(formatReport(built)).toContain("total from Analyze 10.0 s");
+  });
+
   it("omits the pose-pass clause when no passes were dispatched", () => {
     const built = buildReport(new StageTimer(), { frames: 0, seconds: 0 });
     expect(built.summary).toBe("0 frames");

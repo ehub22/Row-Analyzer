@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   drawPlan,
   fillTensor,
+  transferCrop,
   POSE_MEAN,
   POSE_STD,
   type RasterMode,
@@ -55,6 +56,23 @@ describe("drawPlan", () => {
     });
     expect(plan.sx).toBe(-50);
     expect(plan.sy).toBe(-10);
+  });
+});
+
+describe("transferCrop", () => {
+  it("includes the source pixels and remaps only the raster rectangle", () => {
+    const crop = { x: 40.5, y: 20.25, width: 100, height: 200, confidence: 1 };
+    const bounds = transferCrop(crop, 640, 360)!;
+    expect(bounds).toMatchObject({ sx: 38, sy: 18, sw: 105, sh: 205 });
+    expect(drawPlan(bounds.sw, bounds.sh, 288, 384, bounds.localCrop)).toEqual({
+      sx: 2.5,
+      sy: 2.25,
+      sw: 100,
+      sh: 200,
+      dw: 288,
+      dh: 384,
+    });
+    expect(transferCrop({ ...crop, x: -200 }, 640, 360)).toBeNull();
   });
 });
 

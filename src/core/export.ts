@@ -2,6 +2,7 @@ import { jsPDF } from "jspdf";
 import type { Session } from "./types";
 import { mean, crewTiming, segmentStrokes } from "./strokes";
 import { jointNames } from "./keypoints";
+import { MODEL_UNAVAILABLE_FLAG } from "./bodyLayout";
 export function download(
   data: BlobPart,
   name: string,
@@ -19,6 +20,7 @@ export const exportJSON = (session: Session) =>
 export function exportCSV(s: Session) {
   const rows = [
     ["Source", s.demo ? "SYNTHETIC DEMO" : "Experimental video analysis"],
+    ["Pose joints", s.poseJoints ?? 133],
     [
       "Seat",
       "Stroke",
@@ -57,6 +59,7 @@ export function exportLabels(s: Session) {
       format: "row-analyzer-corrections-v1",
       source: s.name,
       synthetic: s.demo,
+      pose_joints: s.poseJoints ?? 133,
       image_size: [s.width, s.height],
       keypoint_names: jointNames,
       note: "COCO-style partial labels. Only manual points exported; extract exact timestamp frames locally before training.",
@@ -99,11 +102,14 @@ export function exportPDF(s: Session) {
     `${s.name} | ${s.boat.name} | ${s.boat.discipline} | ${s.boat.seats} seats`,
   );
   text(`Model: ${s.model}`);
+  text(`Pose layout: ${s.poseJoints ?? 133} COCO joints`);
   if (s.boat.feetHidden !== undefined)
     text(
       s.boat.feetHidden
         ? "Feet: hidden by the hull. Ankle and foot keypoints were not estimated; cycle timing uses hip and knee motion."
-        : "Feet: visible. Ankle and foot keypoints were tracked.",
+        : s.poseJoints === 17
+          ? "Feet: visible. The body-only model may estimate ankles; toe and heel keypoints are not provided and are never counted as model observations."
+          : "Feet: visible. Ankle and foot keypoints were tracked.",
     );
   text(`Runtime: ${s.provider}`);
   text(
@@ -172,6 +178,9 @@ export function validateSession(value: unknown): Session {
     typeof s.demo !== "boolean" ||
     typeof s.model !== "string" ||
     typeof s.provider !== "string" ||
+    (s.poseJoints !== undefined &&
+      s.poseJoints !== 17 &&
+      s.poseJoints !== 133) ||
     !Number.isInteger(s.boat.bestSeat) ||
     s.boat.bestSeat < 1 ||
     s.boat.bestSeat > s.boat.seats ||
@@ -220,6 +229,16 @@ export function validateSession(value: unknown): Session {
       !Number.isFinite(f.identityConfidence) ||
       f.identityConfidence < 0 ||
       f.identityConfidence > 1 ||
+      (f.boxSource !== undefined &&
+        !["detected", "predicted"].includes(f.boxSource)) ||
+      (f.detectorAge !== undefined &&
+        (!Number.isInteger(f.detectorAge) ||
+          f.detectorAge < 0 ||
+          f.detectorAge > 2)) ||
+      (f.boxSource === "predicted" &&
+        (!f.detectorAge ||
+          f.identityConfidence > Math.max(0, 0.9 - f.detectorAge * 0.15))) ||
+      (f.boxSource === "detected" && f.detectorAge !== 0) ||
       !Array.isArray(f.points) ||
       f.points.length !== 133 ||
       f.points.some(
@@ -230,8 +249,21 @@ export function validateSession(value: unknown): Session {
           !Number.isFinite(p.confidence) ||
           p.confidence < 0 ||
           p.confidence > 1 ||
-          !["observed", "inferred", "manual", "missing"].includes(p.origin),
-      )
+          !["observed", "inferred", "manual", "missing"].includes(p.origin) ||
+          (p.flags !== undefined &&
+            (!Array.isArray(p.flags) ||
+              p.flags.some((flag) => typeof flag !== "string"))),
+      ) ||
+      (s.poseJoints === 17 &&
+        f.points
+          .slice(17)
+          .some(
+            (p) =>
+              p.origin !== "manual" &&
+              (p.origin !== "missing" ||
+                p.confidence !== 0 ||
+                !p.flags?.includes(MODEL_UNAVAILABLE_FLAG)),
+          ))
     )
       throw Error("Invalid frame/keypoint data in session.");
   }

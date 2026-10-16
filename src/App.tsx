@@ -37,11 +37,21 @@ import {
 } from "lucide-react";
 import Viewer, { framesAt } from "./components/Viewer";
 import { MotionChart, CrewChart } from "./components/Charts";
-import type { Boat, Session, ModelSettings, Correction } from "./core/types";
+import type {
+  Boat,
+  Session,
+  ModelSettings,
+  Correction,
+  Point,
+} from "./core/types";
 import { boatClasses, defaultBoat, defaultModels, colors } from "./core/types";
 import { createDemo } from "./core/demo";
-import { mean, segmentStrokes, crewTiming } from "./core/strokes";
-import { applyCorrection, HIDDEN_FEET_FLAG } from "./core/occlusion";
+import { mean, crewMean, segmentStrokes, crewTiming } from "./core/strokes";
+import {
+  applyCorrection,
+  HIDDEN_FEET_FLAG,
+  MODEL_UNAVAILABLE_FLAG,
+} from "./core/occlusion";
 import {
   modelSpecs,
   downloadModel,
@@ -77,6 +87,7 @@ import {
   summarizePlan,
 } from "./core/parallel";
 import { describeTta } from "./core/tta";
+import { formatReport } from "./core/perf";
 const tabs = ["Overview", "Crew timing", "Compare", "Keyframe labels"];
 const metricNames = [
   "Catch shin angle",
@@ -131,11 +142,11 @@ function App() {
     importCompare = useRef<HTMLInputElement>(null),
     worker = useRef<Worker | null>(null),
     poseWorkers = useRef<Worker[]>([]);
-  const previewBitmap = useRef<ImageBitmap | null>(null);
+  // Keep received handles alive until React has committed the replacement.
+  // Closing one on receipt of the next message can race Viewer's draw effect.
+  const previewBitmaps = useRef(new Set<ImageBitmap>());
   /** Terminates the coordinator and every pose-pool worker. */
   function stopWorkers() {
-    previewBitmap.current?.close();
-    previewBitmap.current = null;
     setLivePreview(null);
     worker.current?.terminate();
     worker.current = null;
@@ -145,10 +156,35 @@ function App() {
   const busy = progress !== null;
   const currentBoat = session?.boat || boat;
   const rows = session?.strokes.filter((s) => crew || s.seat === seat) || [];
-  const rate = mean(rows.map((s) => s.rate.value)),
-    ratio = mean(rows.map((s) => s.ratio.value)),
+  const rate = crew
+      ? crewMean(rows, currentBoat.seats, (s) => s.rate.value)
+      : mean(rows.map((s) => s.rate.value)),
+    ratio = crew
+      ? crewMean(rows, currentBoat.seats, (s) => s.ratio.value)
+      : mean(rows.map((s) => s.ratio.value)),
     confidence = mean(rows.map((s) => s.confidence));
-  useEffect(() => () => stopWorkers(), []);
+  const sessionCrewRate = session
+    ? crewMean(session.strokes, session.boat.seats, (s) => s.rate.value)
+    : null;
+  const comparisonCrewRate = compare
+    ? crewMean(compare.strokes, compare.boat.seats, (s) => s.rate.value)
+    : null;
+  useEffect(() => {
+    for (const bitmap of previewBitmaps.current) {
+      if (bitmap !== livePreview?.bitmap) {
+        bitmap.close();
+        previewBitmaps.current.delete(bitmap);
+      }
+    }
+  }, [livePreview]);
+  useEffect(
+    () => () => {
+      stopWorkers();
+      for (const bitmap of previewBitmaps.current) bitmap.close();
+      previewBitmaps.current.clear();
+    },
+    [],
+  );
   useEffect(
     () => () => {
       if (url) URL.revokeObjectURL(url);
@@ -272,10 +308,13 @@ function App() {
     setSeat(def.seats);
   }
   /** Local file (user choice) > Cache Storage > streamed download. */
-  /** Local file (user choice) > Cache Storage > streamed download. */
   async function resolveModel(id: ModelId, token: number): Promise<File> {
     const local = id === "detector" ? detector : pose;
     if (local) return local;
+    if (id === "pose" && settings.poseJoints === 17)
+      throw new ModelLoadError(
+        "Body-only mode needs a compatible COCO-17 ONNX pose file. Import one under Models & settings; the cached whole-body model cannot be substituted.",
+      );
     const known = resolvedModels.current[id];
     if (known) return known;
     return downloadOrCache(id, modelSpecs[id], token, true);
@@ -385,6 +424,7 @@ function App() {
     setBaseline(null);
     setProgress(0);
     setStatus("Preparing models…");
+    const clickedAt = performance.now();
     const token = ++runToken.current;
     const models = await prepareModels(token);
     if (!models || token !== runToken.current) return;
@@ -435,15 +475,25 @@ function App() {
         return;
       }
       if (type === "preview") {
-        previewBitmap.current?.close();
-        previewBitmap.current = payload.bitmap;
+        previewBitmaps.current.add(payload.bitmap);
         setLivePreview(payload);
       }
       if (type === "progress") setProgress(payload);
       if (type === "status") setStatus(payload);
       if (type === "result") {
-        setSession(payload);
-        setBaseline(structuredClone(payload));
+        const result = payload as Session;
+        if (result.performance) {
+          result.performance.totalSeconds =
+            (performance.now() - clickedAt) / 1000;
+          result.performance.summary = formatReport(result.performance);
+          result.warnings = result.warnings.map((note) =>
+            note.startsWith("Performance:")
+              ? `Performance: ${result.performance!.summary}`
+              : note,
+          );
+        }
+        setSession(result);
+        setBaseline(structuredClone(result));
         setSeat(boat.bestSeat);
         setProgress(null);
         setTime(0);
@@ -514,15 +564,23 @@ function App() {
   }
   const activeFrames = session ? framesAt(session, time) : [];
   const selectedFrame = activeFrames.find((f) => f.seat === seat);
+  const poseJoints = session?.poseJoints ?? 133;
+  const modelEligible = (p: Point, i: number) =>
+    i < poseJoints &&
+    !p.flags?.includes(HIDDEN_FEET_FLAG) &&
+    !p.flags?.includes(MODEL_UNAVAILABLE_FLAG);
   const observed =
     selectedFrame?.points.filter(
-      (p) => p.origin === "observed" || p.origin === "manual",
-    ).length || 0;
-  // Joints dropped because the session declares the feet hidden cannot be
-  // observed, so they do not count against the frame.
+      (p, i) =>
+        modelEligible(p, i) &&
+        (p.origin === "observed" || p.origin === "manual"),
+    ).length ?? 0;
   const observable =
-    selectedFrame?.points.filter((p) => !p.flags?.includes(HIDDEN_FEET_FLAG))
-      .length ?? 133;
+    selectedFrame?.points.filter(modelEligible).length ?? poseJoints;
+  const manualOutsideModel =
+    selectedFrame?.points.filter(
+      (p, i) => i >= poseJoints && p.origin === "manual",
+    ).length ?? 0;
   return (
     <div className="app-shell">
       <input
@@ -800,9 +858,9 @@ function App() {
                     </p>
                     <div className="comparison-stat">
                       <span>
-                        {mean(
-                          s?.strokes.map((v) => v.rate.value) || [],
-                        )?.toFixed(1) || "—"}
+                        {(i ? comparisonCrewRate : sessionCrewRate)?.toFixed(
+                          1,
+                        ) || "—"}
                       </span>{" "}
                       strokes per minute
                     </div>
@@ -841,9 +899,9 @@ function App() {
                       Rate difference:{" "}
                       {session.demo === compare.demo &&
                       session.boat.discipline === compare.boat.discipline &&
-                      mean(session.strokes.map((s) => s.rate.value)) !== null &&
-                      mean(compare.strokes.map((s) => s.rate.value)) !== null
-                        ? `${(mean(session.strokes.map((s) => s.rate.value))! - mean(compare.strokes.map((s) => s.rate.value))!).toFixed(1)} spm (current − comparison)`
+                      sessionCrewRate !== null &&
+                      comparisonCrewRate !== null
+                        ? `${(sessionCrewRate - comparisonCrewRate).toFixed(1)} spm (current − comparison)`
                         : "withheld"}
                       . Different camera angles and evidence coverage can change
                       timing quality. Phase-normalized 3D/model-stroke
@@ -1111,13 +1169,16 @@ function App() {
                           modelState.detector.state === "cached" ||
                           modelState.detector.state === "ready") &&
                         (pose ||
-                          modelState.pose.state === "cached" ||
-                          modelState.pose.state === "ready")
-                          ? "Whole-body models ready"
-                          : "Models download on first analysis"}
+                          (settings.poseJoints === 133 &&
+                            (modelState.pose.state === "cached" ||
+                              modelState.pose.state === "ready")))
+                          ? `${settings.poseJoints === 17 ? "Body-only" : "Whole-body"} models ready`
+                          : settings.poseJoints === 17
+                            ? "Import a COCO-17 pose model"
+                            : "Models download on first analysis"}
                       </strong>
                       <small>
-                        {`133 joints · ${describeTta(settings.tta)}`}
+                        {`${settings.poseJoints} joints · ${describeTta(settings.tta)}`}
                       </small>
                     </span>
                     <ChevronRight size={15} />
@@ -1218,8 +1279,15 @@ function App() {
                       </strong>
                       <span>
                         {" "}
-                        observed or manually corrected
-                        {observable < 133 ? " · feet hidden by hull" : ""}
+                        model-supported joints observed or manually corrected
+                        {poseJoints === 17
+                          ? " · body-only model; hands/face/feet not estimated"
+                          : observable < 133
+                            ? " · feet hidden by hull"
+                            : ""}
+                        {manualOutsideModel
+                          ? ` · ${manualOutsideModel} extra manual labels`
+                          : ""}
                       </span>
                     </div>
                     <button
@@ -1554,9 +1622,16 @@ function App() {
                   </label>
                   <label>
                     <Activity size={18} />
-                    <strong>Whole-body pose</strong>
+                    <strong>
+                      {settings.poseJoints === 17
+                        ? "Body-only pose"
+                        : "Whole-body pose"}
+                    </strong>
                     <span>
-                      {pose?.name || "DWPose / RTMW · COCO WholeBody 133"}
+                      {pose?.name ||
+                        (settings.poseJoints === 17
+                          ? "Import a trained COCO-17 ONNX file"
+                          : "DWPose / RTMW · COCO WholeBody 133")}
                     </span>
                     <input
                       aria-label="Pose model"
@@ -1585,27 +1660,31 @@ function App() {
                         : 0;
                     const label = local
                       ? `Using local file · ${local.name}`
-                      : st.state === "cached"
-                        ? `Cached · ${mb(st.total)}`
-                        : st.state === "ready"
-                          ? `Downloaded and cached · ${mb(st.total)}`
-                          : st.state === "downloading"
-                            ? `Downloading · ${pct}% of ${mb(st.total)}`
-                            : st.state === "checking"
-                              ? "Checking cache…"
-                              : spec.url
-                                ? "Not cached · downloads on first analysis"
-                                : "No download URL in this build · import locally";
+                      : id === "pose" && settings.poseJoints === 17
+                        ? "COCO-17 requires a local file · cached 133-joint weights are not used"
+                        : st.state === "cached"
+                          ? `Cached · ${mb(st.total)}`
+                          : st.state === "ready"
+                            ? `Downloaded and cached · ${mb(st.total)}`
+                            : st.state === "downloading"
+                              ? `Downloading · ${pct}% of ${mb(st.total)}`
+                              : st.state === "checking"
+                                ? "Checking cache…"
+                                : spec.url
+                                  ? "Not cached · downloads on first analysis"
+                                  : "No download URL in this build · import locally";
                     return (
                       <div className="model-cache-row" key={id}>
                         <div>
                           <strong>{spec.label}</strong>
                           <small>{label}</small>
-                          {st.state === "error" && !local && (
-                            <small className="model-cache-error" role="alert">
-                              {st.error}
-                            </small>
-                          )}
+                          {st.state === "error" &&
+                            !local &&
+                            !(id === "pose" && settings.poseJoints === 17) && (
+                              <small className="model-cache-error" role="alert">
+                                {st.error}
+                              </small>
+                            )}
                         </div>
                         {st.state === "downloading" && (
                           <progress
@@ -1616,6 +1695,7 @@ function App() {
                         )}
                         <div className="model-cache-actions">
                           {spec.url &&
+                            !(id === "pose" && settings.poseJoints === 17) &&
                             !local &&
                             st.state !== "cached" &&
                             st.state !== "ready" &&
@@ -1689,10 +1769,40 @@ function App() {
                       }
                     >
                       <option value="simcc">SimCC · DWPose / RTMW</option>
-                      <option value="heatmap">Heatmaps · WholeBody 133</option>
+                      <option value="heatmap">
+                        Heatmaps · selected joint layout
+                      </option>
                     </select>
                   </label>
                 </div>
+                <label>
+                  Pose joint layout
+                  <select
+                    aria-label="Pose joint layout"
+                    value={settings.poseJoints}
+                    onChange={(e) => {
+                      const joints = +e.target
+                        .value as ModelSettings["poseJoints"];
+                      setPose(null);
+                      setSettings({
+                        ...settings,
+                        poseJoints: joints,
+                        width: joints === 17 ? 192 : 288,
+                        height: joints === 17 ? 256 : 384,
+                      });
+                    }}
+                  >
+                    <option value="133">COCO WholeBody · 133 joints</option>
+                    <option value="17">COCO body only · 17 joints</option>
+                  </select>
+                </label>
+                <p className="note">
+                  Body-only mode requires a separate trained COCO-17 ONNX file
+                  imported locally; it cannot make a 133-joint model faster by
+                  ignoring its output. The input dimensions change to 192 × 256
+                  as a starting point—match the exact export you import. Feet,
+                  face, and hand points are not estimated in this mode.
+                </p>
                 <div className="two-fields">
                   <label>
                     Input width
@@ -1760,14 +1870,13 @@ function App() {
                   </label>
                 </div>
                 <p className="note">
-                  Pose inference — the slow part — runs in parallel across these
-                  workers, one model session each, so it scales with your CPU
-                  cores even where WebGPU is unavailable. More workers are
-                  faster but each loads its own copy of the pose model (~134 MB
-                  for DWPose-l), so Auto leaves a core free for decoding and
-                  caps the pool at 4. Threaded WASM per worker additionally
-                  needs cross-origin isolation (COOP/COEP); the deployed site
-                  enables that with a service worker after one reload.
+                  Detector and pose inference overlap. The pose pool runs one
+                  model session per worker, and each DWPose-l copy uses roughly
+                  134 MB before runtime overhead. Auto caps the pool at four,
+                  reserves CPU for decode/UI, and assigns spare threads to the
+                  detector on large machines. Threaded WASM per worker needs
+                  cross-origin isolation (COOP/COEP); the deployed site enables
+                  that with a service worker after one reload.
                 </p>
                 <details className="region-settings">
                   <summary>
@@ -1807,6 +1916,36 @@ function App() {
                   </div>
                 </details>
                 <label>
+                  Detector cadence
+                  <select
+                    aria-label="Detector cadence"
+                    value={settings.detectorCadence}
+                    onChange={(e) =>
+                      setSettings({
+                        ...settings,
+                        detectorCadence: e.target
+                          .value as ModelSettings["detectorCadence"],
+                      })
+                    }
+                  >
+                    <option value="every-frame">
+                      Every frame · fresh detection (default)
+                    </option>
+                    <option value="auto">
+                      Auto · experimental guarded crop reuse
+                    </option>
+                  </select>
+                </label>
+                <p className="note">
+                  Every frame keeps a fresh person detection for the safest
+                  seat-identity review. Experimental Auto starts the same way
+                  and only reuses short-lived, pose-checked crops when detection
+                  limits speed; weak evidence refreshes immediately. Pose still
+                  runs on every decoded frame with a valid seat, and predicted
+                  crop positions carry lower identity confidence. This path has
+                  not been validated against labeled rowing footage.
+                </p>
+                <label>
                   Test-time augmentation
                   <select
                     aria-label="Test-time augmentation"
@@ -1828,14 +1967,15 @@ function App() {
                   </select>
                 </label>
                 <p className="note">
-                  Pose inference is the slow part of a run, and each pass of a
-                  crop is a full whole-body inference. <strong>Adaptive</strong>{" "}
-                  runs the single pass first and spends the other three (second
-                  scale + both flips) only where that pass left a body joint
-                  below 0.3 — the same four passes fuse exactly as in Always.{" "}
-                  <strong>Always</strong> pays four passes on every crop;{" "}
-                  <strong>Off</strong> pays one and reports no disagreement
-                  flag. Crops are always distributed across the pose workers.
+                  Detector and pose inference can both dominate a run; each pass
+                  of a crop executes the entire selected pose model.{" "}
+                  <strong>Adaptive</strong> runs the single pass first and
+                  spends the other three (second scale + both flips) only where
+                  that pass left a body joint below 0.3 — the same four passes
+                  fuse exactly as in Always. <strong>Always</strong> pays four
+                  passes on every crop; <strong>Off</strong> pays one and
+                  reports no disagreement flag. Crops are always distributed
+                  across the pose workers.
                 </p>
                 <label className="check-label">
                   <input
@@ -1882,11 +2022,12 @@ function App() {
                   </a>
                 </div>
                 <p className="note">
-                  DWPose uses 288 × 384 RGB ImageNet-normalized input, with two
-                  SimCC outputs. Check the export contract before loading other
-                  models. ViTPose/Sapiens whole-body models need compatible
-                  exports and substantially more memory. See the repository’s
-                  model guide.
+                  Both layouts require COCO joint order, RGB ImageNet-normalized
+                  input, and matching SimCC or heatmap outputs. DWPose uses 288
+                  × 384; a smaller body-only export may use 192 × 256. Check its
+                  actual input and coordinate contract before import. A 17-joint
+                  setting does not accelerate a 133-joint checkpoint. See the
+                  repository’s model guide.
                 </p>
                 <button
                   className="button dark full"

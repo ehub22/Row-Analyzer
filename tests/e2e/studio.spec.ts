@@ -119,8 +119,18 @@ test("models dialog exposes parallel worker controls and the live plan", async (
   await expect(plan).toHaveValue(/logical cores/);
   await workers.selectOption("2");
   await expect(plan).toHaveValue(/2 pose workers/);
+  const cadence = page.getByLabel("Detector cadence");
+  await expect(cadence).toHaveValue("every-frame");
+  await cadence.selectOption("auto");
+  await expect(cadence).toHaveValue("auto");
+  const layout = page.getByLabel("Pose joint layout");
+  await expect(layout).toHaveValue("133");
+  await layout.selectOption("17");
+  await expect(page.getByLabel("Input width")).toHaveValue("192");
+  await expect(page.getByLabel("Input height")).toHaveValue("256");
+  await expect(page.getByText(/COCO-17 requires a local file/)).toBeVisible();
   await expect(
-    page.getByText(/runs in parallel across these workers/),
+    page.getByText(/Detector and pose inference overlap/),
   ).toBeVisible();
   await page.getByRole("button", { name: "Close dialog" }).click();
 });

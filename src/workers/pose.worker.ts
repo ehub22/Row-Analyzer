@@ -31,13 +31,11 @@
 //        { type: "pose-result", id, points, timings } | { type: "pose-error", id, error }
 
 import * as ort from "onnxruntime-web/wasm";
-import {
-  configureOrtRuntime,
-  ortWasmOnlyVariant,
-} from "../core/ortRuntime";
+import { configureOrtRuntime, ortWasmOnlyVariant } from "../core/ortRuntime";
 import { decodeSimCC, decodeHeatmap, unflip } from "../core/pose";
 import { Rasterizer } from "../core/preprocess";
-import { checkPoseContract } from "../core/compat";
+import { checkPoseContract, checkPoseOutputDims } from "../core/compat";
+import { padPose } from "../core/bodyLayout";
 import type { Box, Point } from "../core/types";
 
 interface InitMessage {
@@ -45,6 +43,7 @@ interface InitMessage {
   /** Blob reference; each worker reads its own copy of the model bytes. */
   poseFile: File;
   format: "simcc" | "heatmap";
+  joints: 17 | 133;
   width: number;
   height: number;
   wasmThreads: number;
@@ -58,6 +57,8 @@ interface PoseMessage {
   /** Frame bitmap to rasterise here; the fast path. */
   bitmap?: ImageBitmap;
   crop: Box;
+  /** Bitmap-local rectangle; decoded joints still use the full-frame crop. */
+  rasterCrop?: Box;
   flip: boolean;
   format: "simcc" | "heatmap";
 }
@@ -72,8 +73,12 @@ interface PassTimings {
 let session: ort.InferenceSession | null = null;
 let port: MessagePort | null = null;
 let rasterizer: Rasterizer | null = null;
-let init: { format: "simcc" | "heatmap"; width: number; height: number } | null =
-  null;
+let init: {
+  format: "simcc" | "heatmap";
+  joints: 17 | 133;
+  width: number;
+  height: number;
+} | null = null;
 
 const reply = (message: unknown) => port?.postMessage(message);
 const errText = (e: unknown) =>
@@ -89,8 +94,10 @@ async function setup(msg: InitMessage): Promise<void> {
       await msg.poseFile.arrayBuffer(),
       { executionProviders: ["wasm"] },
     );
-    const shape = (m: { isTensor: boolean; shape?: readonly (number | string)[] }) =>
-      m.isTensor && m.shape ? m.shape : [];
+    const shape = (m: {
+      isTensor: boolean;
+      shape?: readonly (number | string)[];
+    }) => (m.isTensor && m.shape ? m.shape : []);
     // Same fail-fast contract check the single-session path performs.
     checkPoseContract(
       shape(session.inputMetadata[0]),
@@ -98,11 +105,40 @@ async function setup(msg: InitMessage): Promise<void> {
       msg.format,
       msg.width,
       msg.height,
+      msg.joints,
     );
+    const probe = new ort.Tensor(
+      "float32",
+      new Float32Array(3 * msg.width * msg.height),
+      [1, 3, msg.height, msg.width],
+    );
+    try {
+      const outputs = await session.run({ [session.inputNames[0]]: probe });
+      try {
+        checkPoseOutputDims(
+          session.outputNames.map((name) => outputs[name].dims),
+          msg.format,
+          msg.width,
+          msg.height,
+          msg.joints,
+        );
+      } finally {
+        Object.values(outputs).forEach((tensor) => tensor.dispose());
+      }
+    } finally {
+      probe.dispose();
+    }
     rasterizer = new Rasterizer(msg.width, msg.height, "pose");
-    init = { format: msg.format, width: msg.width, height: msg.height };
-    reply({ type: "ready" });
+    init = {
+      format: msg.format,
+      joints: msg.joints,
+      width: msg.width,
+      height: msg.height,
+    };
+    reply({ type: "ready", joints: msg.joints });
   } catch (e) {
+    await session?.release().catch(() => {});
+    session = null;
     reply({ type: "init-error", error: errText(e) });
   }
 }
@@ -113,37 +149,39 @@ function decodePoints(
   crop: Box,
 ): Point[] {
   const vals = session!.outputNames.map((n) => outputs[n]);
-  if (format === "simcc") {
-    if (
-      vals.length !== 2 ||
-      vals[0].dims.length !== 3 ||
-      vals[0].dims[1] !== 133 ||
-      vals[1].dims[1] !== 133
-    )
-      throw Error(
-        "Expected a 133-joint whole-body SimCC export, not a 17-joint body model.",
-      );
+  const { width, height, joints } = init!;
+  checkPoseOutputDims(
+    vals.map((v) => v.dims),
+    format,
+    width,
+    height,
+    joints,
+  );
+  if (format === "simcc")
     return decodeSimCC(
       vals[0].data as Float32Array,
       vals[1].data as Float32Array,
       vals[0].dims[2],
       vals[1].dims[2],
       crop,
+      joints,
     );
-  }
-  if (vals[0].dims.length !== 4 || vals[0].dims[1] !== 133)
-    throw Error("Expected [1,133,H,W] heatmaps.");
   return decodeHeatmap(
     vals[0].data as Float32Array,
     vals[0].dims[3],
     vals[0].dims[2],
     crop,
+    joints,
   );
 }
 
 async function runPose(msg: PoseMessage): Promise<void> {
   if (!session || !init) {
-    reply({ type: "pose-error", id: msg.id, error: "Pose session not initialised." });
+    reply({
+      type: "pose-error",
+      id: msg.id,
+      error: "Pose session not initialised.",
+    });
     return;
   }
   const timings: PassTimings = { preprocess: 0, infer: 0, decode: 0 };
@@ -155,7 +193,7 @@ async function runPose(msg: PoseMessage): Promise<void> {
         msg.bitmap,
         msg.bitmap.width,
         msg.bitmap.height,
-        msg.crop,
+        msg.rasterCrop ?? msg.crop,
         msg.flip,
       );
       input = new ort.Tensor("float32", data, [1, 3, init.height, init.width]);
@@ -176,7 +214,10 @@ async function runPose(msg: PoseMessage): Promise<void> {
       reply({
         type: "pose-result",
         id: msg.id,
-        points: msg.flip ? unflip(points, msg.crop) : points,
+        points: padPose(
+          msg.flip ? unflip(points, msg.crop) : points,
+          init.joints,
+        ),
         timings,
       });
     } finally {

@@ -42,6 +42,26 @@ export interface DrawPlan {
   dh: number;
 }
 
+/** Integer pixel bounds with a two-pixel filter margin for a transferable crop. */
+export function transferCrop(
+  crop: Box,
+  width: number,
+  height: number,
+): { sx: number; sy: number; sw: number; sh: number; localCrop: Box } | null {
+  const sx = Math.max(0, Math.floor(crop.x - 2));
+  const sy = Math.max(0, Math.floor(crop.y - 2));
+  const ex = Math.min(width, Math.ceil(crop.x + crop.width + 2));
+  const ey = Math.min(height, Math.ceil(crop.y + crop.height + 2));
+  if (ex <= sx || ey <= sy) return null;
+  return {
+    sx,
+    sy,
+    sw: ex - sx,
+    sh: ey - sy,
+    localCrop: { ...crop, x: crop.x - sx, y: crop.y - sy },
+  };
+}
+
 /**
  * `crop` (a pose/TTA box) is stretched to fill the whole input; without a crop
  * the frame is letterboxed to preserve aspect ratio, which is what the detector
@@ -236,9 +256,8 @@ export class FrameSource {
   }
 
   /**
-   * The frame bitmap, when one could be created. Posting it to a worker
-   * serializes a handle to the same pixels (no copy) while this source keeps
-   * its own, which is what lets every pass of a frame share one conversion.
+   * The frame bitmap, when one could be created. Pose workers receive cropped
+   * transferable handles; the source keeps its own for detection and preview.
    */
   get bitmapImage(): ImageBitmap | null {
     return this.bitmap;
