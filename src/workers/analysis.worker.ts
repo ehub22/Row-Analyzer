@@ -22,6 +22,7 @@ import {
   recoverOcclusion,
   suppressHiddenJoints,
 } from "../core/occlusion";
+import { describeKneeOcclusion, discardOccludedKnees } from "../core/knees";
 import { segmentStrokes } from "../core/strokes";
 import { estimateCamera } from "../core/geometry";
 import { FrameSource, Rasterizer, transferCrop } from "../core/preprocess";
@@ -1058,9 +1059,18 @@ async function run(job: Job) {
       () => {},
     );
     await pipeline.drain();
-    send("status", "Recovering short gaps and segmenting stroke cycles…");
+    send("status", "Discarding occluded knees, recovering short gaps…");
+    // Before the gap filler: a discarded knee is a flagged missing point, and
+    // flagged points are never interpolated (core/occlusion.ts). Filling one
+    // would turn the guess this pass just removed into a straight line between
+    // the frames on either side of the hull.
+    const knees = await timer.timeAsync("knees", async () =>
+      discardOccludedKnees(frames, job.boat),
+    );
+    const kneeNote = describeKneeOcclusion(knees);
+    if (kneeNote) notes.push(kneeNote);
     const recovered = await timer.timeAsync("recover", async () =>
-      recoverOcclusion(frames),
+      recoverOcclusion(knees.frames),
     );
     const strokes = await timer.timeAsync("strokes", async () =>
       segmentStrokes(recovered),

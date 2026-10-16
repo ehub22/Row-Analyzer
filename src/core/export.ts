@@ -3,6 +3,8 @@ import type { Session } from "./types";
 import { mean, crewTiming, segmentStrokes } from "./strokes";
 import { jointNames } from "./keypoints";
 import { MODEL_UNAVAILABLE_FLAG } from "./bodyLayout";
+import { expectedOcclusion } from "./occlusion";
+import { KNEE_JOINTS } from "./knees";
 export function download(
   data: BlobPart,
   name: string,
@@ -110,6 +112,17 @@ export function exportPDF(s: Session) {
         : s.poseJoints === 17
           ? "Feet: visible. The body-only model may estimate ankles; toe and heel keypoints are not provided and are never counted as model observations."
           : "Feet: visible. Ankle and foot keypoints were tracked.",
+    );
+  // Counted from the frames themselves, so an imported session reports what it
+  // contains rather than trusting a claim.
+  const occludedKnees = s.frames.reduce(
+    (n, f) =>
+      n + KNEE_JOINTS.filter((j) => expectedOcclusion(f.points[j])).length,
+    0,
+  );
+  if (occludedKnees)
+    text(
+      `Knees at the finish: ${occludedKnees} knee samples were discarded as gunwale or oar occlusion and marked missing with a reason. With the legs flat the knee drops to the hull edge and the loom crosses it, and a pose model still answers - pinned to the gunwale or dragged onto the shaft - so those answers are not tracked, counted as evidence, or drawn. The catch end of the stroke is untouched; each finish proxy is timed from the bridged trough instead of from a guess.`,
     );
   text(`Runtime: ${s.provider}`);
   text(

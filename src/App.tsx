@@ -47,11 +47,7 @@ import type {
 import { boatClasses, defaultBoat, defaultModels, colors } from "./core/types";
 import { createDemo } from "./core/demo";
 import { mean, crewMean, segmentStrokes, crewTiming } from "./core/strokes";
-import {
-  applyCorrection,
-  HIDDEN_FEET_FLAG,
-  MODEL_UNAVAILABLE_FLAG,
-} from "./core/occlusion";
+import { applyCorrection, expectedOcclusion } from "./core/occlusion";
 import {
   modelSpecs,
   downloadModel,
@@ -565,10 +561,12 @@ function App() {
   const activeFrames = session ? framesAt(session, time) : [];
   const selectedFrame = activeFrames.find((f) => f.seat === seat);
   const poseJoints = session?.poseJoints ?? 133;
+  // A joint the model could have answered for: inside the model's own layout,
+  // and not one the setup or the footage rules out — feet below the gunwale,
+  // joints a body-only model does not supply, knees behind the hull or the
+  // loom at the finish. The rest are not counted as evidence the model missed.
   const modelEligible = (p: Point, i: number) =>
-    i < poseJoints &&
-    !p.flags?.includes(HIDDEN_FEET_FLAG) &&
-    !p.flags?.includes(MODEL_UNAVAILABLE_FLAG);
+    i < poseJoints && !expectedOcclusion(p);
   const observed =
     selectedFrame?.points.filter(
       (p, i) =>

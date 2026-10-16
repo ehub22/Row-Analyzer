@@ -1,9 +1,11 @@
 # Row Analyzer — implementation roadmap
 
 ## Product contract
+
 A private, offline desktop-Chrome rowing review workbench. Seat 1 is bow seat; the highest numbered seat is stroke seat. Support sweep and sculling without imposing symmetric body motion. Original footage and manual labels remain on-device; never publish private sample footage with the website. A synthetic demonstration is explicitly labeled, never substituted for an uploaded clip. Unavailable measurements read **withheld**, not zero. Confidence scores are evidence quality indicators, not calibrated probabilities.
 
 ## Architecture and technology decisions
+
 - React + TypeScript + Vite: static, inspectable client deployable under a GitHub Pages subpath. No video-upload service, analytics, or API keys.
 - WebCodecs + MP4 demuxing: decode presentation timestamps, including variable frame rate. Feed frames with bounded backpressure into a dedicated worker. MOV works only when its container/codec is supported; report decoder failures explicitly rather than silently using imprecise seek sampling.
 - ONNX Runtime Web: request WebGPU and probe it with a warm-up inference; fall back to WASM when adapter/graph/operator/GPU support is absent (this failure is common across Chrome/Firefox/Safari and must not abort analysis). OffscreenCanvas performs preprocessing in the worker. WASM pose inference runs in a pool of parallel worker sessions (no cross-origin isolation required), plus threaded WASM per session when the page is cross-origin isolated — on Pages, `public/coi-serviceworker.js` supplies the COOP/COEP headers a static host cannot set. Download/import model weights separately from code. Weights may be cached in Cache Storage after download (never Git or Pages); video and keypoints are never persisted automatically.
@@ -12,7 +14,9 @@ A private, offline desktop-Chrome rowing review workbench. Seat 1 is bow seat; t
 - SVG/canvas overlays and plots; JSON session/correction interchange, CSV stroke tables, PDF coaching report. Comparison uses timestamped stroke events and compatible metric provenance, not arbitrary pixel coordinates.
 
 ## Model evaluation and release gate
+
 Candidates are evaluated by suitability, **not an invented rowing benchmark**:
+
 1. **ViTPose large/huge (whole-body fine-tuned head)**: strong heatmap formulation; useful for spatial uncertainty, flip/multi-scale fusion, and sub-pixel refinement. Large weights/attention activations and browser operator support are substantial risks. A standard COCO-17 checkpoint is insufficient for hands/feet. Provide a heatmap adapter for COCO-WholeBody-133 exports.
 2. **RTMW / DWPose whole-body (133 joints), high-resolution large/x variants**: practical browser-first candidate, with hands and feet. Their usual ONNX exports output SimCC distributions, **not 2D heatmaps**. Keep/decode these distributions with sub-pixel refinement and TTA; do not relabel them as heatmaps. Prefer RTMW-x where memory permits; evaluate DWPose as a baseline, not a claim of highest accuracy.
 3. **Sapiens-class**: high-resolution human foundation models merit offline GPU evaluation. Memory, export compatibility, input resolution, licensing, and checkpoint keypoint taxonomy preclude assuming universal Chrome support. Best suited to an optional local GPU batch companion.
@@ -21,6 +25,7 @@ Candidates are evaluated by suitability, **not an invented rowing benchmark**:
 Use authentic trained model files, record their names/configuration, and reject incompatible tensor shapes. Local model import keeps browser inference independent of model-host CORS and prevents bundling hundreds of MB into Git. Before claiming accuracy, annotate held-out rowing clips and compare PCK/OKS, hand/foot error, seat ID switches, catch/finish timing error, and angle error against calibrated multi-view ground truth. The first release must visibly identify this gate as unmet if weights or labeled ground truth are unavailable.
 
 ## Data model
+
 - Session: schema version, source filename (not file contents), dimensions, duration, actual decoded timestamps, boat class, discipline, seat count, per-seat rigging, best-visible seat, processing settings, model provenance, warnings.
 - PoseFrame: presentation time in seconds; seat ID; 133 keypoints in source-image pixels; each keypoint has confidence, origin (`observed`, `inferred`, `manual`, `missing`), optional flags. Optional 3D points require an explicit coordinate-system/calibration provenance.
 - BoatCalibration: shell axis, azimuth estimate/confidence, known dimensions, camera intrinsics/extrinsics if available, observability flags. A shell axis in the image alone does not determine azimuth.
@@ -28,6 +33,7 @@ Use authentic trained model files, record their names/configuration, and reject 
 - Correction: seat, timestamp, joint index, old/new position, source visibility, neighborhood refit extent. COCO-style training export retains frame identity and visibility; inferred labels excluded from ground truth.
 
 ## Occlusion and seat strategy
+
 1. Initialize seats by position along shell axis (bow direction must be verified), with best-visible seat selected. Rower detections are not automatically coxswains or seats: initial selection is reviewable.
 2. Associate globally using predicted positions and boat-axis ordering; reject implausible motion/ambiguous assignments instead of exchanging identities. Maintain empty tracks through disappearance. Nearest-neighbor association alone is insufficient for crossing eights.
 3. Preserve raw observations. Reject sudden low-confidence jumps. Fill only short, bounded gaps bidirectionally, cap inferred confidence, leave long gaps missing. Do not smooth through a flagged discontinuity.
@@ -36,11 +42,13 @@ Use authentic trained model files, record their names/configuration, and reject 
 6. Coaching metrics dominated by inference are withheld. UI differentiates solid observed, dashed inferred, manual corrected, and missing keypoints.
 
 ## Camera normalization and scale
+
 Automatic multi-cue camera estimation is a research milestone, not a solved consequence of 2D keypoints. Hull/rigger lines, oar shafts, hip/shoulder seat alignment and compensated optical flow can propose hypotheses. Bow/stern symmetry, unknown focal length, camera motion, and foreshortening create ambiguities. Fuse independent cues and abstain when underconstrained. A user-verified axis is a useful assist, not an automatic azimuth measurement.
 
 Known shell length, rigger spread and oar length constrain scale only with valid projections/calibration. An eight has no single exact standard length; use a manufacturer/user value (roughly 17–18 m as guidance, not ground truth). Do not derive split per 500 m from panning video. A genuine 3D lifting model and camera solution are prerequisites for normalized trunk, shin, knee, hip, elbow, shoulder, head, and oar angles. Withhold these until then. Synthetic projection tests validate the geometry implementation, not monocular depth recovery.
 
 ## Milestones and acceptance tests
+
 1. **Foundation**: accessible workbench, roadmap, private upload, source playback, frame navigation, boat/rigging setup, clearly marked synthetic demo. Verify build and UI.
 2. **Decode/inference**: WebCodecs worker, bounded frame queue, cancellable progress, detector and whole-body ONNX adapters, GPU/WASM fallback, padded crops, flip + multi-scale TTA and sub-pixel decoding. Test tensor decoding/crop mapping and actual clip decode. Accuracy claims require real weights and labels.
 3. **Seat/occlusion**: stable seat slots, gated global assignment, missing tracks, short-gap completion, jump flags, manual correction and local propagation. Test masking and crossing/ambiguity fixtures.
@@ -51,6 +59,7 @@ Known shell length, rigger spread and oar length constrain scale only with valid
 8. **Research completion**: annotated rowing benchmark, detector selection excluding coxswains, hull/handle/oar models, automatic motion-compensated calibration, rowing-trained 3D lift, cyclic/bone/handle/stretcher priors and companion GPU inference. Only then promote inferred biomechanics to validated coaching measurements.
 
 ## Risks and mitigations
+
 - Heavy occlusion, spray, reflections, far-side hands: retain missing data; improve camera position; keyframe correction; label visibility explicitly.
 - Monocular depth ambiguity: never promise viewpoint-invariant angles without calibration; no 2D cosine “correction.”
 - Hardware/memory/operator variation: bounded queues, cancel controls, WASM fallback, local files, honest failure messages; optional local GPU companion later.
@@ -60,11 +69,13 @@ Known shell length, rigger spread and oar length constrain scale only with valid
 - Sample videos are not labeled ground truth: visual inspection is not proof of accuracy; publish validation status, never the private clips.
 
 ## Labeling/fine-tuning workflow
+
 Choose representative catch/drive/finish/recovery keyframes across sweep/scull, views and occlusion severity; assign seats; correct visible joints and mark hidden joints missing. Export corrections with video/frame IDs and timestamps. Extract matching frames locally, obtain athlete consent, split by athlete/crew/session (not adjacent frames), fine-tune whole-body models with boat/rigging masks and realistic occlusions. Evaluate held-out hand/foot PCK, seat switches and timing/angle errors. Never train on propagated/inferred points as if human-labeled. Re-import compatible ONNX exports and keep a versioned model/benchmark manifest.
 
 ## Implementation checkpoint (2026-10-14)
 
 Milestones 1 and most of 2/3/5/6 have working engineering implementations, with the following explicit qualifications:
+
 - Reference weights are external and not validated; runtime was tested using ONNX test doubles.
 - Seat association is global image-space assignment, not a completed motion-compensated boat-frame tracker.
 - Occlusion recovery is short bounded interpolation and jump gating, not learned cyclic/3D completion or a full biomechanical optimizer.
@@ -100,32 +111,32 @@ Fixed since the checkpoint above:
 
 Verified in the build sandbox with `scripts/gpu-analysis-check.mjs` against the dev server and the production bundle, using constant ONNX test doubles and a generated H.264 clip (Chromium 153, SwiftShader as the only adapter):
 
-| Run | Result |
-| --- | --- |
-| Adapter available | `provider: WebGPU (google · swiftshader) detector / WebGPU (google · swiftshader) pose`; only the asyncify glue + wasm fetched; no WebGPU failure warnings |
+| Run                                    | Result                                                                                                                                                          |
+| -------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Adapter available                      | `provider: WebGPU (google · swiftshader) detector / WebGPU (google · swiftshader) pose`; only the asyncify glue + wasm fetched; no WebGPU failure warnings      |
 | No adapter (`requestAdapter()` → null) | `provider: WASM detector / WASM pool (1 worker × 2 threads) pose`; note explains the missing adapter and points at `chrome://gpu`; only the plain build fetched |
-| Force WASM | WASM pool; note records that WebGPU was skipped on request |
+| Force WASM                             | WASM pool; note records that WebGPU was skipped on request                                                                                                      |
 
 Still not validated here: real pretrained weights, real hardware GPUs (the sandbox only has a software adapter), Safari/Firefox, and the mid-run device-loss path (implemented and type-checked, not triggered by a real device loss). See the validation report.
 
 ## Pose-stage speed update (2026-10-14)
 
 The pool made pose inference parallel, but profiling the CPU side of the pipeline
-in the same sandbox found the *coordinator* was the bottleneck: every crop was
+in the same sandbox found the _coordinator_ was the bottleneck: every crop was
 drawn from the decoded `VideoFrame` and normalised on the analysis worker's
 thread, once per person × TTA pass, while every pooled worker waited for work.
 
 Measured in the build sandbox (Chromium 153, SwiftShader, 2 vCPU, constant ONNX
 test doubles and a generated 640×360 H.264 clip; `scripts/pose-perf-check.mjs`):
 
-| Step | Per call |
-| --- | --- |
-| `VideoFrame` crop → 288×384 tensor (previous path, per pass) | ~23 ms |
-| frame `ImageBitmap` crop → same tensor (per pass) | ~7 ms |
-| letterboxed 640×640 detector tensor | ~8.6 ms |
-| SimCC decode, 133 joints × both axes | ~0.27 ms |
-| `fusePoses` (4 passes) | ~0.06 ms |
-| `SeatTracker.update` (8 seats) | ~0.68 ms |
+| Step                                                         | Per call |
+| ------------------------------------------------------------ | -------- |
+| `VideoFrame` crop → 288×384 tensor (previous path, per pass) | ~23 ms   |
+| frame `ImageBitmap` crop → same tensor (per pass)            | ~7 ms    |
+| letterboxed 640×640 detector tensor                          | ~8.6 ms  |
+| SimCC decode, 133 joints × both axes                         | ~0.27 ms |
+| `fusePoses` (4 passes)                                       | ~0.06 ms |
+| `SeatTracker.update` (8 seats)                               | ~0.68 ms |
 
 Implemented since:
 
@@ -147,7 +158,7 @@ Implemented since:
   single pass runs first and the remaining three are dispatched only when a body
   joint (COCO-17 subset of the 133-joint layout) came back below 0.3 or the body
   mean is below 0.5. A rejected crop fuses the identical four passes as
-  *Always*; on the test-double clip 2880 of 3840 passes were skipped.
+  _Always_; on the test-double clip 2880 of 3840 passes were skipped.
 - **Detector/pose overlap** (`src/core/queue.ts`): a bounded, in-order stage
   pipeline keeps one frame's pose work in flight while the next frame is
   detected. It is only used when a pose pool exists — a WebGPU or local-WASM run
@@ -203,16 +214,16 @@ trusted them:
   local extrema, so 20 spm read as ~40 even with perfectly visible feet. PR #7's
   1.2 s merge window only hid this above one particular rate.
 - **The adaptive TTA gate** required both ankles, so 64–100% of on-water crops
-  paid for all four passes: *Adaptive* silently cost as much as *Always*.
+  paid for all four passes: _Adaptive_ silently cost as much as _Always_.
 
 Implemented:
 
 - **Expected occlusion** (`src/core/occlusion.ts`, `Boat.feetHidden`, setup
-  field *Feet in view*, default *Hidden by the hull*): ankle and foot outputs
+  field _Feet in view_, default _Hidden by the hull_): ankle and foot outputs
   (joints 15–22) are replaced by explicit missing joints with a reason before
   tracking, preview and export. Manual points are kept. The session records
   the setting; the viewer legend, the joint counter and the PDF report say
-  so. *Visible* restores tracking for ergometer and overhead footage.
+  so. _Visible_ restores tracking for ergometer and overhead footage.
 - **Thigh-elevation cycles** (`src/core/strokes.ts`): with the ankle fixed on
   the stretcher and the hip on a horizontal slide, the hip→knee segment rises
   to the catch and falls flat at the finish, so the same events come from
@@ -235,11 +246,104 @@ Implemented:
   behaviours for hidden feet (guess, drop, visible) and optional hull
   occlusion of the knees. Results and caveats are in
   [VALIDATION.md](docs/VALIDATION.md); `ROW_SIM_REPORT=1 npx vitest run
-  tests/feet.test.ts` reprints the table.
+tests/feet.test.ts` reprints the table.
 
 Not changed: seat tracking, TTA fusion, decoding, and every accuracy gate.
 Sessions saved before this update keep their frames; re-importing one re-runs
 the new segmentation on them.
+
+## Knees at the finish (2026-10-16)
+
+The hidden-feet update moved stroke timing onto the knees — and the knees are
+covered too. With the legs flat the knee drops to the gunwale (46% of every
+cycle in the simulation), and in a side view the loom crosses the legs on the
+way out (another 14%). A pose model answers for a covered knee in two ways,
+and both were tracked as observations:
+
+- **Pinned to the gunwale.** The knee is reported on the hull edge, the lowest
+  line it can lie on, at confidence 0.30–0.60: about 21 px from where the knee
+  is, and the trough of the thigh-elevation cycle flattened onto that line.
+- **Dragged onto the loom.** The knee is reported on the shaft, about 16 px
+  off, lifting the trough by up to 19° of elevation — a third of the stroke's
+  range, and enough to move the finish proxy by a tenth of a cycle.
+
+Every stroke event is timed from that trough, so the finish proxy wandered
+over a quarter of the cycle (0.33–0.63 of it, against a true legs-flat middle
+of 0.415) while catches and rate stayed right. Unlike the feet this cannot be
+declared hidden for the session: the same knee is perfectly visible a tenth of
+a second earlier, at the catch, and that sample is the one the timing needs.
+
+Implemented:
+
+- **Knee occlusion windows** (`src/core/knees.ts`): the top of a seat's
+  thigh-elevation range is the catch, which neither the gunwale nor the loom
+  reaches, so those frames calibrate what a visible knee looks like on this
+  footage — its confidence and its apparent thigh length. Below that band a
+  frame is a candidate when its knees, pooled over both legs, look weaker than
+  the seat's own clear view; candidates are believed only where they are dense
+  (a majority of a ±0.08 s neighbourhood, sustained for at least 0.15 s), each
+  dense window is confirmed as a whole and trimmed back to the frames that
+  still look occluded. Confirmed knees become missing points with a reason:
+  not tracked, not gap-filled, not drawn, not counted as evidence. Manual
+  points are kept, and a seat that cannot be calibrated is left alone.
+- **A model that changes its mind** (`src/core/knees.ts`): the ordinary case is
+  neither a consistent guess nor a consistent dropout but a coin flip between
+  them on every frame, and neither answer carries enough evidence on its own —
+  a dropout has nothing to judge, and a guess between dropouts is one frame. So
+  a frame whose knees are both gone takes its place in the cycle from its
+  neighbours and cannot split the crossing it belongs to; a window is confirmed
+  only where the model answered at least a quarter of its frames, which keeps
+  an honest dropout from being read as a guess; and where the confirmed windows
+  cover at least half the time the knee is low — a gunwale, which the knee sits
+  behind for half of every stroke, rather than a loom crossing a seventh of it —
+  the weak frames between the windows are discarded too, down to the trough
+  line and never above it.
+- **Expected occlusion vocabulary** (`src/core/occlusion.ts`): the knee flag
+  joins `HIDDEN_FEET_FLAG` and `expectedOcclusion()` names the absences the
+  setup or the footage explains. The cycle evidence gate (`src/core/strokes.ts`)
+  and the joint counter (`src/App.tsx`) read it, so a knee the hull was in
+  front of is no longer counted as evidence the model failed to find — without
+  that, discarding the guesses would have withheld the very rates the visible
+  catch peaks support.
+- **Hull troughs, generalized** (`src/core/strokes.ts`): a blind spot counts as
+  a hull trough when either end lies inside the trough _band_, not only when it
+  is the very lowest sample, because the sample a blind spot ends on is
+  smoothed towards the flank beside it; and each end is judged on its own
+  elevation as well as on the smoothed one, because the descent after a catch
+  runs at about 100°/s and smoothing ±0.1 s inflates a blind-spot edge by
+  10–15°. Without this the discarded windows split cycles at high rates.
+- **Simulation fixture** (`tests/fixtures/rowingSim.ts`): the loom now hides
+  the knee for a set fraction of the cycle centred on the finish, reported
+  either dropped or dragged along the shaft within bounded offsets — or a
+  per-frame coin flip between the two — and the ground truth says which frames
+  each occluder covered. `tests/knees.test.ts`
+  pins the behaviour; `ROW_SIM_REPORT=1 npx vitest run tests/knees.test.ts`
+  reprints the before/after table (summarized in
+  [VALIDATION.md](docs/VALIDATION.md)).
+- **Demonstration crew** (`src/core/demo.ts`): its procedural knee used to
+  slide along a straight line, so the thigh grew by a quarter of its length
+  between the catch and the finish — precisely what the occlusion pass looks
+  for. The demo leg is now a rigid two-link chain solved from hip and ankle;
+  the pass judges all eight seats and discards nothing.
+
+Measured on the seeded simulation (30 s clips, three seeds, 20 and 28 spm, eight
+occlusion scenarios): no covered knee is tracked as an observation any more
+(was 100% of them at the gunwale and on the loom, 52% and 49% where the model
+alternates between the two answers, 16–21 px from the truth; now 0% for the
+gunwale however it is answered, and 1–4% at the edges of a loom window), the
+finish proxy returns to 0.34–0.59 of the cycle from 0.29–0.64 — and to
+0.43–0.49 in every scenario but the alternating loom at 28 spm — clear knees
+are discarded in 0–3.2% of their frames, and every cycle is still found at
+every rate. Footage where the model _drops_ the covered knee instead
+of guessing it is byte-identical to before: there is nothing to discard, and
+the bridged trough already carried the finish.
+
+Not changed: the catch end of the stroke, seat tracking, decoding, TTA fusion
+and every accuracy gate. The adaptive TTA gate still requires both knees: a
+covered knee is either guessed at an ordinary confidence, which the gate
+already accepts, or dropped, and a dropped knee needs no second opinion —
+relaxing the gate for knees the hull covers was measured to save no passes at
+all, so it was not added.
 
 Still open, in rough order of expected value:
 
@@ -253,7 +357,22 @@ Still open, in rough order of expected value:
   stretcher in the image. It needs real footage to validate, so knee and
   ankle angles stay withheld.
 - **Fine-tune with occluded feet labelled missing**, so the model stops
-  guessing them (see *Labeling/fine-tuning workflow* above).
+  guessing them (see _Labeling/fine-tuning workflow_ above) — and with knees
+  behind the gunwale or the loom labelled missing too, which would make the
+  occlusion windows unnecessary rather than merely handled.
+- **A knee latched onto the handle near the catch** is not detected: the
+  occlusion pass judges only the low part of the cycle, because the catch end
+  must stay untouched. Catching it needs a length reference that does not
+  depend on a per-frame detection box, and boxes merge when rowers overlap.
+- **Short loom windows** (under 0.5 s) are discarded but not bridged, so their
+  finish comes from the low samples that survive on either side of the shaft:
+  0.38–0.48 of the cycle measured against a true 0.415.
+- **An alternating loom at 28 spm** is the weakest row measured, 0.34–0.59
+  against the same true 0.415: the dropouts inside a crossing leave holes short
+  enough for the existing short-gap recovery to interpolate across, and those
+  `inferred` knees then enter the cycle signal a few pixels off. Excluding
+  interpolated joints from that signal was measured and cost a cycle in thirty,
+  so they stay in and the residual is documented instead.
 - **Tracker re-acquisition** using the seat-order constraint: a seat is
   dropped after 31 frames (~1 s) without a match and never comes back.
 - **Far-side eye and ear** are permanently weak in a side view and still count

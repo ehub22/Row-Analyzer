@@ -15,7 +15,8 @@ A private, offline rowing-video review workbench for desktop Chrome. **Research 
 - Top-down YOLOX / YOLOv8/11 detector adapters, aspect-correct padded crops, COCO-17 body-only or COCO-WholeBody-133 SimCC/heatmap pose adapters, sub-pixel decoding, four-pass flip/multi-scale coordinate fusion. Body-only runs retain 133 session slots but mark unmodeled joints missing, never observed.
 - Global seat assignment with ambiguity gates; short bidirectional gap filling; observed/inferred/manual/missing provenance; low-confidence jump rejection.
 - Per-seat and crew review; catch/finish **body-motion proxies** from thigh (hip-to-knee) elevation, stroke rate, drive-to-recovery ratio, crew timing in milliseconds and phase degrees.
-- **Hidden feet are handled as expected occlusion.** On the water the feet are strapped to the stretcher below the gunwale, so a whole-body model can only guess them. With *Feet in view: Hidden by the hull* (the default) those guesses are discarded instead of tracked: stroke cycles are timed from hips and knees, which stay above the gunwale; the adaptive TTA gate stops paying four passes per crop for joints no pass can reveal; and when the knees also drop behind the hull with the legs flat, the cycle is bridged rather than lost. Choose *Visible* for ergometer or overhead footage.
+- **Hidden feet are handled as expected occlusion.** On the water the feet are strapped to the stretcher below the gunwale, so a whole-body model can only guess them. With _Feet in view: Hidden by the hull_ (the default) those guesses are discarded instead of tracked: stroke cycles are timed from hips and knees, which stay above the gunwale; the adaptive TTA gate stops paying four passes per crop for joints no pass can reveal; and when the knees also drop behind the hull with the legs flat, the cycle is bridged rather than lost. Choose _Visible_ for ergometer or overhead footage.
+- **A knee the gunwale or the oar covers is not tracked either.** With the legs flat the knee drops to the hull edge, and in a side view the loom crosses the legs on the way out; a pose model answers anyway — pinned to the gunwale, or dragged onto the shaft — at a confidence that reads as observed, which lifted the trough every stroke event is timed from and moved the finish proxy over a quarter of the cycle. Each seat's own clear-view knee near the catch calibrates what a visible knee looks like on that footage; where the low part of the cycle measures weaker than that — densely, and for long enough to be an occluder rather than noise — the guesses are discarded with a reason and the finish is timed from the bridged trough instead. A model does not answer the same covered knee the same way twice — it finds the hull edge on one frame and loses the joint on the next — so a crossing it answers inconsistently is still read as one window rather than as runs too short to believe. The catch end of the stroke is left exactly as the model reported it, footage whose knees the model already drops is untouched, and a knee the hull was in front of is not counted as evidence the model failed to find.
 - Manual keypoint corrections with local refit, partial COCO-style training labels, JSON sessions, CSV tables, PDF reports.
 - Saved-session timing comparison. Explicitly labeled synthetic demonstration.
 
@@ -44,18 +45,18 @@ npm run test:e2e       # production-browser workflow tests
 ## Use
 
 1. Import a short MP4/MOV clip (up to 300 MB, 20,000 decoded-frame guard). Choose the shell, rigging, seat count, best-visible seat, and bow direction in the image.
-2. Open **Models & settings**. When the build has model URLs configured, the detector and whole-body models download automatically on the first analysis (with progress) and are cached in this browser. Otherwise import compatible ONNX files from your device. Set **Pose joint layout** to 133 (default) or 17 and match input dimensions/format to the export. Body-only mode requires a separate local COCO-17 model: cached 133-joint weights are never silently used. **Test-time augmentation** chooses how many pose inferences one crop gets: *Adaptive* (default) runs the single pass first and spends the other three — second scale plus both flips — only where that pass left a body joint below 0.3, *Always* pays four passes on every crop, *Off* pays one. **Parallel pose workers** controls how many CPU workers share those passes (Auto is right for most machines; each extra worker loads another copy of the pose model). **Detector cadence** defaults to *Every frame* for a fresh person detection on each frame. Experimental *Auto* begins the same way and reuses a guarded crop for at most two frames only when measured detector time justifies it; every decoded frame with a viable seat still gets a fresh pose inference. Validate identities before relying on the experimental mode.
+2. Open **Models & settings**. When the build has model URLs configured, the detector and whole-body models download automatically on the first analysis (with progress) and are cached in this browser. Otherwise import compatible ONNX files from your device. Set **Pose joint layout** to 133 (default) or 17 and match input dimensions/format to the export. Body-only mode requires a separate local COCO-17 model: cached 133-joint weights are never silently used. **Test-time augmentation** chooses how many pose inferences one crop gets: _Adaptive_ (default) runs the single pass first and spends the other three — second scale plus both flips — only where that pass left a body joint below 0.3, _Always_ pays four passes on every crop, _Off_ pays one. **Parallel pose workers** controls how many CPU workers share those passes (Auto is right for most machines; each extra worker loads another copy of the pose model). **Detector cadence** defaults to _Every frame_ for a fresh person detection on each frame. Experimental _Auto_ begins the same way and reuses a guarded crop for at most two frames only when measured detector time justifies it; every decoded frame with a viable seat still gets a fresh pose inference. Validate identities before relying on the experimental mode.
 3. If needed, use the detection-region percentage bounds to exclude bystanders/coxswain detection centers. This is a static region; the crew must stay inside it.
 4. Analyze. All decoded frames are submitted. Initialization stops if detected people do not match configured seats, rather than silently assigning incorrect identities.
 5. Verify identity, observations, and occlusion. Use **Keyframe labels** to correct only visible joints. Select a joint and click to add a missing observation, or drag an existing point.
-6. Export your session/report before starting a new session. Nothing is stored persistently automatically. To restore, open the JSON then import the original video with the same filename. Model weights (never video or keypoints) may be cached by the browser; remove them with *Clear cached models*.
+6. Export your session/report before starting a new session. Nothing is stored persistently automatically. To restore, open the JSON then import the original video with the same filename. Model weights (never video or keypoints) may be cached by the browser; remove them with _Clear cached models_.
 7. Open **Compare** and import another exported JSON session. Current comparison is aggregate timing, not normalized 3D technique.
 
 The synthetic demo works without model downloads and is always marked as synthetic in the UI and exports.
 
 ## Speed: where the time goes, and what to turn
 
-Every run now measures itself. The workspace's *Analysis notes* start with a
+Every run now measures itself. The workspace's _Analysis notes_ start with a
 performance line (also stored in exported sessions as `performance`), for
 example:
 
@@ -77,8 +78,8 @@ Levers to test against your run's stage report (the supplied large-model pair is
 1. **Test-time augmentation.** Four passes per crop is four whole-body
    inferences. Adaptive (the default) runs one pass first and only pays for the
    rest where a body joint came back below 0.3 — on clean footage that is the
-   single biggest saving available, and where a crop *is* weak the same four
-   passes fuse exactly as under *Always*. Joints the session declares hidden
+   single biggest saving available, and where a crop _is_ weak the same four
+   passes fuse exactly as under _Always_. Joints the session declares hidden
    (the ankles, on the water) do not count: before that, a guessed ankle made
    nearly every on-water crop pay all four passes.
 2. **Pose workers and cross-origin isolation.** The pool is how CPU inference
@@ -96,7 +97,7 @@ Levers to test against your run's stage report (the supplied large-model pair is
    poses, with a new detector run at least every third frame. Joints still come
    from the current frame; predicted crop positions are not fresh detections
    and reduce seat-identity confidence. On a pose-bound run it deliberately
-   keeps detecting every frame. *Every frame* is the default baseline;
+   keeps detecting every frame. _Every frame_ is the default baseline;
    a compatible smaller detector may help if the detector remains the bottleneck.
 5. **Fewer pixels of crew.** The detection-region bounds and the boat's seat
    count decide how many crops exist at all; a single scull is one crop per
@@ -116,7 +117,7 @@ verified rather than assumed:
   coordinates are retained for keypoint decoding. On `5.mov`,
   `node scripts/crop-equivalence-check.mjs` compares 50 real-frame pose tensors
   (including flips and edge crops) against the full-frame path: all floats
-  matched exactly. Transferring *full-frame* bitmap clones was slower on this
+  matched exactly. Transferring _full-frame_ bitmap clones was slower on this
   clip and is not used.
 - **Crops are rasterised in the workers.** Each pose worker draws and normalises
   its own crop from that bitmap into a reused buffer. Previously rasterisation
@@ -131,23 +132,24 @@ equivalence check and times each stage on your own machine.
 
 ## Modules
 
-| Module | Responsibility |
-| --- | --- |
-| `src/core/video.ts` | MP4 demux, codec validation, timestamped bounded decoding |
-| `src/core/detection.ts` | detector output decoding, NMS, padded crop geometry |
-| `src/core/pose.ts` | whole-body SimCC/heatmap decoding, mirror mapping, TTA fusion |
-| `src/core/tracking.ts` | stable seat slots, global assignment, ambiguity abstention |
-| `src/core/geometry.ts` | calibrated 3D transforms, scale utility, camera abstention |
-| `src/core/occlusion.ts` | expected occlusion (feet hidden by the hull), short-gap recovery, jump rejection, manual refit |
-| `src/core/strokes.ts` | thigh-elevation cycle proxies (hips and knees only), hull-trough bridging, evidence gating, crew synchronization |
-| `src/core/export.ts` | sessions, partial training labels, CSV and PDF |
-| `src/core/preprocess.ts` | frame → model tensor rasterisation: one bitmap per frame, reused canvas/buffer |
-| `src/core/tta.ts` | test-time-augmentation policy and the adaptive pass gate (ignores joints hidden for the session) |
-| `src/core/queue.ts` | bounded, in-order stage pipeline (detector and pose overlap) |
-| `src/core/perf.ts` | per-stage timing and the run's performance summary |
-| `src/core/parallel.ts` / `src/core/pool.ts` | worker-pool + WASM-thread planning; least-busy pose job dispatch with failover |
-| `src/workers/analysis.worker.ts` | ONNX sessions and offline pipeline orchestration |
-| `src/workers/pose.worker.ts` | one pooled pose-inference session (×N, connected by MessageChannel) |
+| Module                                      | Responsibility                                                                                                                                                                             |
+| ------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `src/core/video.ts`                         | MP4 demux, codec validation, timestamped bounded decoding                                                                                                                                  |
+| `src/core/detection.ts`                     | detector output decoding, NMS, padded crop geometry                                                                                                                                        |
+| `src/core/pose.ts`                          | whole-body SimCC/heatmap decoding, mirror mapping, TTA fusion                                                                                                                              |
+| `src/core/tracking.ts`                      | stable seat slots, global assignment, ambiguity abstention                                                                                                                                 |
+| `src/core/geometry.ts`                      | calibrated 3D transforms, scale utility, camera abstention, shared quantile/median                                                                                                         |
+| `src/core/occlusion.ts`                     | expected occlusion (feet hidden by the hull, knees behind it), short-gap recovery, jump rejection, manual refit                                                                            |
+| `src/core/knees.ts`                         | knee occlusion windows at the finish: per-seat clear-view calibration, dense-window confirmation, a crossing answered differently frame to frame read as one window, discard with a reason |
+| `src/core/strokes.ts`                       | thigh-elevation cycle proxies (hips and knees only), hull-trough bridging, evidence gating, crew synchronization                                                                           |
+| `src/core/export.ts`                        | sessions, partial training labels, CSV and PDF                                                                                                                                             |
+| `src/core/preprocess.ts`                    | frame → model tensor rasterisation: one bitmap per frame, reused canvas/buffer                                                                                                             |
+| `src/core/tta.ts`                           | test-time-augmentation policy and the adaptive pass gate (ignores joints hidden for the session)                                                                                           |
+| `src/core/queue.ts`                         | bounded, in-order stage pipeline (detector and pose overlap)                                                                                                                               |
+| `src/core/perf.ts`                          | per-stage timing and the run's performance summary                                                                                                                                         |
+| `src/core/parallel.ts` / `src/core/pool.ts` | worker-pool + WASM-thread planning; least-busy pose job dispatch with failover                                                                                                             |
+| `src/workers/analysis.worker.ts`            | ONNX sessions and offline pipeline orchestration                                                                                                                                           |
+| `src/workers/pose.worker.ts`                | one pooled pose-inference session (×N, connected by MessageChannel)                                                                                                                        |
 
 ## Privacy and deployment
 

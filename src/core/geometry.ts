@@ -1,6 +1,23 @@
 import type { Vec3, CameraEstimate, Point } from "./types";
 export const clamp = (v: number, min = 0, max = 1) =>
   Math.max(min, Math.min(max, v));
+/** Linear-interpolated quantile of an ascending-sorted sample. */
+export function quantile(sorted: readonly number[], q: number) {
+  if (!sorted.length) return NaN;
+  const i = (sorted.length - 1) * q,
+    a = Math.floor(i),
+    b = Math.ceil(i);
+  return sorted[a] + (sorted[b] - sorted[a]) * (i - a);
+}
+/** Median of a sample in any order. Null when it is empty. */
+export function median(values: readonly number[]): number | null {
+  return values.length
+    ? quantile(
+        [...values].sort((a, b) => a - b),
+        0.5,
+      )
+    : null;
+}
 export function rotateY(p: Vec3, azimuth: number): Vec3 {
   const t = (azimuth * Math.PI) / 180;
   return {

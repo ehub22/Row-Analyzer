@@ -1,5 +1,6 @@
-import type { PoseFrame, Stroke, Metric, Point } from "./types";
-import { evidence } from "./occlusion";
+import type { Point, PoseFrame, Stroke, Metric } from "./types";
+import { evidence, expectedOcclusion, seen } from "./occlusion";
+import { quantile } from "./geometry";
 export const withheld = (unit: string, reason: string): Metric => ({
   value: null,
   confidence: 0,
@@ -30,7 +31,7 @@ export const withheld = (unit: string, reason: string): Metric => ({
 /** COCO-WholeBody hips. */
 const HIPS: readonly number[] = [11, 12];
 /** [hip, knee] of each leg in the COCO-WholeBody layout. */
-const THIGHS: readonly (readonly [number, number])[] = [
+export const THIGHS: readonly (readonly [number, number])[] = [
   [11, 13],
   [12, 14],
 ];
@@ -53,7 +54,12 @@ const MAX_GAP = 0.5;
  * seat's range and a hip stays in view throughout: it cannot contain a catch.
  */
 const MAX_TROUGH_GAP = 2.5;
-const TROUGH_FRACTION = 0.35;
+/** Fraction of the seat's elevation range, measured up from its lowest, that
+ * counts as the trough: a blind spot is bridged only when both ends are inside
+ * it, because the hull can hide a knee down there but never a catch. Shared
+ * with core/knees.ts, which must not discard a knee above this line — a blind
+ * spot that ended above it would not be bridged, and the cycle would split. */
+export const TROUGH_FRACTION = 0.35;
 /** A cycle across a bridged blind spot may not run longer than this multiple
  * of the seat's median cycle: a doubled period means a catch went missing. */
 const MAX_BRIDGED_PERIOD_RATIO = 1.5;
@@ -68,10 +74,7 @@ const EVENT_BAND = 0.1;
  * hip and knee on the same side. Uses |dx|, so it is independent of which way
  * the crew faces, of image scale and of camera translation.
  */
-const seen = (p: Point | undefined): p is Point =>
-  !!p && p.origin !== "missing" && p.confidence > 0.3;
-
-export function thighElevation(f: PoseFrame): number | null {
+export function thighElevation(f: { points: readonly Point[] }): number | null {
   let sum = 0,
     weight = 0;
   for (const [hip, knee] of THIGHS) {
@@ -211,13 +214,6 @@ function smooth(
   });
 }
 
-function quantile(sorted: readonly number[], q: number) {
-  const i = (sorted.length - 1) * q,
-    a = Math.floor(i),
-    b = Math.ceil(i);
-  return sorted[a] + (sorted[b] - sorted[a]) * (i - a);
-}
-
 /** A contiguous stretch of usable signal: indices into the seat's frames,
  * plus positions p where a hull trough is bridged between idx[p] and
  * idx[p + 1]. */
@@ -234,7 +230,8 @@ export function segmentStrokes(frames: PoseFrame[]): Stroke[] {
       .sort((a, b) => a.time - b.time);
     if (seq.length < 10) continue;
     const times = seq.map((f) => f.time);
-    const signal = smooth(seq.map(thighElevation), times, SMOOTH_HALF_WIDTH);
+    const raw = seq.map(thighElevation);
+    const signal = smooth(raw, times, SMOOTH_HALF_WIDTH);
     const values = signal
       .filter((x): x is number => x !== null)
       .sort((a, b) => a - b);
@@ -242,11 +239,18 @@ export function segmentStrokes(frames: PoseFrame[]): Stroke[] {
     const lo = quantile(values, 0.05),
       troughLine = lo + TROUGH_FRACTION * (quantile(values, 0.95) - lo);
     const hipSeen = seq.map((f) => HIPS.some((j) => seen(f.points[j])));
+    /** Whether the knee at sample i is low enough for the hull to be hiding
+     * it. Read on the sample's own elevation as well as on the smoothed one:
+     * the sample a blind spot ends on is smoothed towards the flank it sits
+     * beside, so a knee that dropped out on the fast descent after a catch
+     * measures high after smoothing while its own value says where it was. */
+    const lowEnough = (i: number) =>
+      Math.min(signal[i]!, raw[i] ?? signal[i]!) <= troughLine;
     /** Whether the blind spot between usable samples i < k is a hull trough
      * (see MAX_TROUGH_GAP). Both ends have a hip, since they have signal. */
     const hullTrough = (i: number, k: number) => {
       if (times[k] - times[i] > MAX_TROUGH_GAP) return false;
-      if (signal[i]! > troughLine || signal[k]! > troughLine) return false;
+      if (!lowEnough(i) || !lowEnough(k)) return false;
       let last = times[i];
       for (let m = i + 1; m <= k; m++) {
         if (!hipSeen[m]) continue;
@@ -291,13 +295,17 @@ export function segmentStrokes(frames: PoseFrame[]): Stroke[] {
         for (let i = a + 1; i < b; i++) if (v[i] < v[low]) low = i;
         const amplitude = (v[a] + v[b]) / 2 - v[low];
         if (amplitude < MIN_PROMINENCE) continue;
+        const floor = v[low] + EVENT_BAND * amplitude;
         const inside = bridges.filter((p) => p >= a && p < b);
-        // When the lowest visible sample borders a bridged blind spot, the
-        // legs-flat phase itself was behind the gunwale. The knee left and
-        // re-entered the view at the same height, so the middle of the blind
-        // spot is the middle of the legs-flat band at gunwale level: the same
-        // estimate as below, at a band edge the hull chose.
-        const hidden = inside.find((p) => p === low || p + 1 === low);
+        // When a bridged blind spot reaches into the trough band, the
+        // legs-flat phase itself was behind the gunwale or the loom. The knee
+        // left and re-entered the view at about the same height, so the middle
+        // of the blind spot is the middle of the legs-flat band: the same
+        // estimate as below, at a band edge the hull chose. It is judged on
+        // the band rather than on adjacency to the lowest sample, because the
+        // sample a blind spot ends on is smoothed towards the flank it sits
+        // beside and is not reliably the very lowest one.
+        const hidden = inside.find((p) => v[p] <= floor || v[p + 1] <= floor);
         let finish: number;
         if (hidden !== undefined) {
           const middle = (t[hidden] + t[hidden + 1]) / 2;
@@ -307,7 +315,6 @@ export function segmentStrokes(frames: PoseFrame[]): Stroke[] {
               m = j;
           finish = times[m];
         } else {
-          const floor = v[low] + EVENT_BAND * amplitude;
           const f = bandMiddle(v, t, low, (x) => x <= floor, a + 1, b - 1);
           if (f === null) continue;
           finish = t[f];
@@ -316,8 +323,17 @@ export function segmentStrokes(frames: PoseFrame[]): Stroke[] {
           recovery = t[b] - finish;
         if (drive < 0.2 || recovery < 0.2) continue;
         const cycle = seq.slice(idx[a], idx[b] + 1),
+          // Joints the setup or the footage says cannot be seen — hidden
+          // feet, a body-only model, a knee behind the gunwale or the loom —
+          // are left out of the count entirely. Their absence is expected, so
+          // it is not evidence the model failed to find, and counting it would
+          // withhold a rate that the visible catch peaks support perfectly.
           ev = evidence(
-            cycle.flatMap((f) => CYCLE_JOINTS.map((j) => f.points[j])),
+            cycle.flatMap((f) =>
+              CYCLE_JOINTS.map((j) => f.points[j]).filter(
+                (p) => !expectedOcclusion(p),
+              ),
+            ),
           ),
           confidence = Math.min(
             ev.confidence,

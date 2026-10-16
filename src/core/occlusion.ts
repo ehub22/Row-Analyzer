@@ -1,5 +1,6 @@
 import type { Boat, PoseFrame, Correction, Point } from "./types";
-export { MODEL_UNAVAILABLE_FLAG } from "./bodyLayout";
+import { MODEL_UNAVAILABLE_FLAG } from "./bodyLayout";
+export { MODEL_UNAVAILABLE_FLAG };
 
 // Expected occlusion.
 //
@@ -24,6 +25,26 @@ export const FOOT_JOINTS: readonly number[] = [15, 16, 17, 18, 19, 20, 21, 22];
 /** Flag carried by every joint dropped as an expected occlusion. */
 export const HIDDEN_FEET_FLAG =
   "Feet hidden by the hull (session setup); model output discarded";
+
+/** Flag carried by a knee the gunwale or the loom covered near the finish.
+ * Unlike the feet this is judged window by window rather than for the session,
+ * so it is written by core/knees.ts; it lives here with the other
+ * expected-occlusion flag because everything below reads it. */
+export const OCCLUDED_KNEE_FLAG =
+  "Knee behind the gunwale or the oar at the finish; model output discarded";
+
+/** Flags that say a joint was absent for a reason the setup or the footage
+ * explains, not because the model failed on a joint the camera could show. */
+export const EXPECTED_OCCLUSION_FLAGS: readonly string[] = [
+  HIDDEN_FEET_FLAG,
+  OCCLUDED_KNEE_FLAG,
+  MODEL_UNAVAILABLE_FLAG,
+];
+
+/** Whether a point is absent for one of those expected reasons. */
+export function expectedOcclusion(p: Point | undefined): boolean {
+  return !!p?.flags?.some((f) => EXPECTED_OCCLUSION_FLAGS.includes(f));
+}
 
 /** Joints the camera cannot see for this boat setup. */
 export function hiddenJoints(
@@ -161,6 +182,14 @@ export function applyCorrection(
     return { ...f, points };
   });
 }
+/**
+ * What the pipeline counts as an observation of a joint: the model placed it
+ * and cleared the 0.3 observed/missing threshold. Manual points count, gap
+ * fills and discarded occlusion guesses do not.
+ */
+export const seen = (p: Point | undefined): p is Point =>
+  !!p && p.origin !== "missing" && p.confidence > 0.3;
+
 export function evidence(points: Point[]) {
   const valid = points.filter((p) => p.origin !== "missing");
   return {
