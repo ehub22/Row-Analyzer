@@ -64,6 +64,44 @@ export type AngleName = (typeof ANGLE_NAMES)[number];
 /** Degrees, so every angle carries the same unit. */
 export const ANGLE_UNIT = "deg";
 
+/** Short labels for tables and CSV headers. */
+export const ANGLE_LABELS: Record<AngleName, string> = {
+  kneeLeft: "Knee L",
+  kneeRight: "Knee R",
+  hipLeft: "Hip L",
+  hipRight: "Hip R",
+  elbowLeft: "Elbow L",
+  elbowRight: "Elbow R",
+  thighLeft: "Thigh L",
+  thighRight: "Thigh R",
+  shinLeft: "Shin L",
+  shinRight: "Shin R",
+  layback: "Layback",
+};
+
+/**
+ * What each angle is, in the words a coach would recognize. Every one is in the
+ * boat's frame: "from vertical" means the boat's vertical, not the image's, and
+ * interior angles read 180 when the joint is straight.
+ */
+export const ANGLE_DESCRIPTIONS: Record<AngleName, string> = {
+  kneeLeft:
+    "Interior angle at the left knee: hip–knee–ankle. Small when compressed.",
+  kneeRight:
+    "Interior angle at the right knee: hip–knee–ankle. Small when compressed.",
+  hipLeft: "Interior angle at the left hip: shoulder–hip–knee.",
+  hipRight: "Interior angle at the right hip: shoulder–hip–knee.",
+  elbowLeft: "Interior angle at the left elbow: shoulder–elbow–wrist.",
+  elbowRight: "Interior angle at the right elbow: shoulder–elbow–wrist.",
+  thighLeft: "Left thigh from the boat's vertical, positive towards the stern.",
+  thighRight:
+    "Right thigh from the boat's vertical, positive towards the stern.",
+  shinLeft: "Left shin from the boat's vertical, positive towards the stern.",
+  shinRight: "Right shin from the boat's vertical, positive towards the stern.",
+  layback:
+    "Trunk from the boat's vertical, both sides averaged: negative forward of it (the catch), positive past it (the finish).",
+};
+
 /** Below this a lifted joint is a guess about a joint the camera could not
  * see, and every angle through it is withheld. Matches the 0.3 the rest of the
  * pipeline uses for "observed". */
@@ -285,7 +323,9 @@ export function anglesAtStroke(
   const at = (time: number, label: string) => {
     const seat = rows.filter((r) => r.seat === stroke.seat);
     if (!seat.length)
-      return emptyAngles(`${label}: no lifted frames for seat ${stroke.seat}`);
+      return withheldAngles(
+        `${label}: no lifted frames for seat ${stroke.seat}`,
+      );
     // Nearest row, but never further away than a fifth of a stroke: an event
     // whose neighbourhood was withheld should not borrow an angle from the
     // other end of the slide.
@@ -294,7 +334,7 @@ export function anglesAtStroke(
       .map((r) => ({ r, d: Math.abs(r.time - time) }))
       .sort((a, b) => a.d - b.d)[0];
     if (near.d > span / 5)
-      return emptyAngles(
+      return withheldAngles(
         `${label}: the nearest lifted frame is ${near.d.toFixed(2)} s away, ` +
           `more than a fifth of a stroke`,
       );
@@ -306,7 +346,9 @@ export function anglesAtStroke(
   };
 }
 
-function emptyAngles(reason: string): Record<AngleName, Metric> {
+/** Every angle withheld, with one reason. Used for a frame whose lift was
+ * refused: the row still exists, still says why, and reports nothing. */
+export function withheldAngles(reason: string): Record<AngleName, Metric> {
   return Object.fromEntries(
     ANGLE_NAMES.map((n) => [n, withheld(ANGLE_UNIT, reason)]),
   ) as Record<AngleName, Metric>;

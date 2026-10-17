@@ -31,6 +31,7 @@ import {
   LIFT_BODY_JOINTS,
   liftAvailable,
   liftFrame,
+  parseLiftOutput,
   placeLift,
   type LiftOutput,
 } from "../src/core/lift";
@@ -418,5 +419,98 @@ describe("running a model", () => {
     const sim = simulateCrew({ seconds: 8, camera: { azimuth: 0 } });
     const frames = prepared(sim);
     expect(liftAvailable(solve(sim, frames)).ok).toBe(false);
+  });
+});
+
+describe("reading a model's output tensors", () => {
+  const coords = () => {
+    const data = new Float32Array(LIFT_BODY_JOINTS * 3);
+    for (let j = 0; j < LIFT_BODY_JOINTS; j++) {
+      data[j * 3] = j * 0.01;
+      data[j * 3 + 1] = 0.5 - j * 0.02;
+      data[j * 3 + 2] = j * 0.005;
+    }
+    return data;
+  };
+
+  it("reads interleaved [1, J, 3] coordinates", () => {
+    const parsed = parseLiftOutput({
+      pose_3d: { dims: [1, LIFT_BODY_JOINTS, 3], data: coords() },
+    });
+    expect("error" in parsed).toBe(false);
+    if ("error" in parsed) return;
+    expect(parsed.output.jointCount).toBe(LIFT_BODY_JOINTS);
+    // Row-major, three numbers a joint: joint 0's y, then joint 1's x.
+    expect(parsed.output.joints[1]).toBeCloseTo(0.5, 6);
+    expect(parsed.output.joints[3]).toBeCloseTo(0.01, 6);
+    // No confidence tensor: every joint carries the model's word for it, and
+    // the reprojection gate is what decides whether the pose is placed.
+    expect(parsed.output.confidence[0]).toBe(1);
+  });
+
+  it("reads planar [1, 3, J] coordinates into the same layout", () => {
+    const planar = new Float32Array(LIFT_BODY_JOINTS * 3);
+    const interleaved = coords();
+    for (let j = 0; j < LIFT_BODY_JOINTS; j++)
+      for (let k = 0; k < 3; k++)
+        planar[k * LIFT_BODY_JOINTS + j] = interleaved[j * 3 + k]!;
+    const a = parseLiftOutput({
+      pose_3d: { dims: [1, 3, LIFT_BODY_JOINTS], data: planar },
+    });
+    const b = parseLiftOutput({
+      pose_3d: { dims: [1, LIFT_BODY_JOINTS, 3], data: interleaved },
+    });
+    expect("error" in a).toBe(false);
+    expect("error" in b).toBe(false);
+    if ("error" in a || "error" in b) return;
+    expect(Array.from(a.output.joints)).toEqual(Array.from(b.output.joints));
+  });
+
+  it("takes a per-joint confidence tensor when the model offers one", () => {
+    const parsed = parseLiftOutput({
+      pose_3d: { dims: [1, LIFT_BODY_JOINTS, 3], data: coords() },
+      conf: {
+        dims: [1, LIFT_BODY_JOINTS],
+        data: new Float32Array(LIFT_BODY_JOINTS).fill(0.4),
+      },
+    });
+    expect("error" in parsed).toBe(false);
+    if ("error" in parsed) return;
+    expect(parsed.output.confidence[0]).toBeCloseTo(0.4, 6);
+  });
+
+  it("refuses a joint count it does not know, naming the shape it saw", () => {
+    const parsed = parseLiftOutput({
+      pose_3d: { dims: [1, 24, 3], data: new Float32Array(24 * 3) },
+    });
+    expect("error" in parsed).toBe(true);
+    if (!("error" in parsed)) return;
+    expect(parsed.error).toMatch(/24 joints/);
+    expect(parsed.error).toMatch(/1, 24, 3/);
+  });
+
+  it("refuses a coordinate tensor that is not three numbers a joint", () => {
+    const parsed = parseLiftOutput({
+      pose_3d: { dims: [1, 50], data: new Float32Array(50) },
+    });
+    expect("error" in parsed).toBe(true);
+    if (!("error" in parsed)) return;
+    expect(parsed.error).toMatch(/not a multiple of 3/);
+  });
+
+  it("refuses an ambiguous layout rather than guessing an axis order", () => {
+    const parsed = parseLiftOutput({
+      pose_3d: { dims: [4, 4, 3, LIFT_BODY_JOINTS], data: coords() },
+    });
+    expect("error" in parsed).toBe(true);
+    if (!("error" in parsed)) return;
+    expect(parsed.error).toMatch(/neither/);
+  });
+
+  it("refuses a model that returned nothing", () => {
+    const parsed = parseLiftOutput({
+      empty: { dims: [0], data: new Float32Array(0) },
+    });
+    expect("error" in parsed).toBe(true);
   });
 });

@@ -158,7 +158,9 @@ describe("angles in the boat frame", () => {
     const j = seated();
     j[14] = { ...at(0.45, 0.05, 0.1)!, origin: "missing", confidence: 0.9 };
     expect(jointAngles(j).kneeRight.value).toBeNull();
-    expect(jointAngles(j).kneeRight.reason).toMatch(/the right knee was not lifted/);
+    expect(jointAngles(j).kneeRight.reason).toMatch(
+      /the right knee was not lifted/,
+    );
   });
 
   it("reports every angle it knows, all in degrees", () => {

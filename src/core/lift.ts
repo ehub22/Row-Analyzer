@@ -370,6 +370,87 @@ export async function liftFrame(
   return placeLift(output, frame, solve, imageSize);
 }
 
+/** A tensor as an inference session hands it over, narrowed to what this module
+ * reads, so the parser can be tested without a runtime. */
+export interface RawTensor {
+  dims: readonly number[];
+  data: ArrayLike<number>;
+}
+
+/**
+ * Reads a lift model's output tensors.
+ *
+ * Layouts vary between 3D pose models, and guessing wrong here would produce
+ * confident nonsense: a joint order shuffled, an axis read as another. So this
+ * accepts the handful of shapes that unambiguously mean "J joints by 3
+ * camera-frame coordinates" and refuses the rest with the shape it saw. A
+ * per-joint confidence output is used when there is one; when there is not, the
+ * joints carry confidence 1 and the caller says so, because the reprojection
+ * gate — not the model's opinion of itself — is what decides whether the pose
+ * is placed.
+ */
+export function parseLiftOutput(
+  outputs: Record<string, RawTensor>,
+): { output: LiftOutput } | { error: string } {
+  const entries = Object.entries(outputs).filter(([, t]) => t.data.length > 0);
+  if (!entries.length) return { error: "The lift returned no output tensors." };
+  // The coordinates are the largest tensor; anything else is metadata.
+  const sorted = [...entries].sort(
+    (a, b) => b[1].data.length - a[1].data.length,
+  );
+  const [coordName, coords] = sorted[0]!;
+  const others = sorted.slice(1);
+
+  const total = coords.data.length;
+  if (total % 3 !== 0)
+    return {
+      error:
+        `The lift's "${coordName}" output has ${total} values, not a ` +
+        `multiple of 3, so it is not J joints by (x, y, z).`,
+    };
+  const count = total / 3;
+  if (count !== LIFT_BODY_JOINTS)
+    return {
+      error:
+        `The lift returned ${count} joints (dims ` +
+        `[${coords.dims.join(", ")}]); this adapter places the ` +
+        `${LIFT_BODY_JOINTS}-joint COCO body layout.`,
+    };
+  // Interleaved [1, J, 3] is what the layout check above assumes. A planar
+  // [1, 3, J] output has the same length, so the dims decide, and anything else
+  // is refused rather than reinterpreted.
+  const dims = coords.dims.filter((d) => d !== 1);
+  const planar =
+    dims.length === 2 && dims[0] === 3 && dims[1] === LIFT_BODY_JOINTS;
+  const interleaved =
+    dims.length === 2 && dims[0] === LIFT_BODY_JOINTS && dims[1] === 3;
+  if (!planar && !interleaved && dims.length !== 1)
+    return {
+      error:
+        `The lift's coordinate output has dims [${coords.dims.join(", ")}], ` +
+        `which is neither [1, ${LIFT_BODY_JOINTS}, 3] nor [1, 3, ${LIFT_BODY_JOINTS}].`,
+    };
+  const joints = new Float32Array(total);
+  for (let j = 0; j < LIFT_BODY_JOINTS; j++)
+    for (let k = 0; k < 3; k++)
+      joints[j * 3 + k] = planar
+        ? coords.data[k * LIFT_BODY_JOINTS + j]!
+        : coords.data[j * 3 + k]!;
+
+  // A confidence tensor, if the model offers one: same joint count, and not the
+  // coordinates themselves.
+  const conf = others.find(([, t]) => t.data.length === LIFT_BODY_JOINTS);
+  const confidence = new Float32Array(LIFT_BODY_JOINTS);
+  for (let j = 0; j < LIFT_BODY_JOINTS; j++)
+    confidence[j] = conf ? conf[1].data[j]! : 1;
+  if (conf)
+    for (let j = 0; j < LIFT_BODY_JOINTS; j++)
+      confidence[j] = Math.max(0, Math.min(1, confidence[j]!));
+  return {
+    output: { joints, confidence, jointCount: LIFT_BODY_JOINTS },
+  };
+}
+
 /** Whether a lift is worth running at all on this session. */
 export function liftAvailable(solve: CameraSolve): {
   ok: boolean;

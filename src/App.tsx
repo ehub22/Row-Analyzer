@@ -39,11 +39,19 @@ import Viewer, { framesAt } from "./components/Viewer";
 import { MotionChart, CrewChart } from "./components/Charts";
 import type {
   Boat,
+  BoatCalibration,
   Session,
   ModelSettings,
   Correction,
   Point,
 } from "./core/types";
+import {
+  ANGLE_LABELS,
+  ANGLE_NAMES,
+  angleRange,
+  anglesAtStroke,
+  type AngleName,
+} from "./core/angles";
 import { boatClasses, defaultBoat, defaultModels, colors } from "./core/types";
 import { createDemo } from "./core/demo";
 import { mean, crewMean, segmentStrokes, crewTiming } from "./core/strokes";
@@ -72,6 +80,7 @@ const mb = (n: number) => `${(n / 1048576).toFixed(1)} MB`;
 import {
   exportJSON,
   exportCSV,
+  exportAnglesCSV,
   exportPDF,
   exportLabels,
   validateSession,
@@ -129,7 +138,10 @@ function App() {
     [livePreview, setLivePreview] = useState<LivePreview | null>(null),
     [status, setStatus] = useState(""),
     [joint, setJoint] = useState(9),
-    [baseline, setBaseline] = useState<Session | null>(null);
+    [baseline, setBaseline] = useState<Session | null>(null),
+    [calibration, setCalibration] = useState<BoatCalibration>({}),
+    [lensMode, setLensMode] = useState<"35mm" | "px">("35mm"),
+    [liftFile, setLiftFile] = useState<File | null>(null);
   const resolvedModels = useRef<Partial<Record<ModelId, File>>>({}),
     downloadAbort = useRef<AbortController | null>(null),
     runToken = useRef(0);
@@ -516,6 +528,10 @@ function App() {
       settings,
       boat,
       parallel: plan,
+      // What the user measured about the boat and the lens. Without it the
+      // camera solve abstains, and normalized angles stay withheld.
+      calibration,
+      lift: liftFile,
     });
   }
   function correct(c: Correction) {
@@ -579,6 +595,59 @@ function App() {
     selectedFrame?.points.filter(
       (p, i) => i >= poseJoints && p.origin === "manual",
     ).length ?? 0;
+  // What the camera solve says, in the words the setup panel has room for. An
+  // abstention is reported as an abstention, with its own reason: the panel is
+  // where a user finds out what to measure.
+  const cam = session?.camera;
+  const cameraLabel = !session
+    ? "Not analyzed"
+    : cam?.source === "synthetic"
+      ? "0° · demo"
+      : cam?.azimuth === null || cam === undefined
+        ? "Unresolved"
+        : `${Math.abs(cam.azimuth).toFixed(1)}° off square`;
+  const cameraCopy = !session
+    ? "Enter a seat spacing and a lens and the crew's own seat line solves the camera: azimuth, distance and scale, with every cue shown."
+    : cam?.source === "synthetic"
+      ? "Known generated view · 100% synthetic certainty. A demo clip has no seat line to solve."
+      : cam && cam.azimuth === null
+        ? cam.reason
+        : `${Math.round((cam?.confidence ?? 0) * 100)}% confidence · ${cam?.distance?.toFixed(1)} m out · ${cam?.pxPerMetre?.toFixed(0)} px per metre at the shell. ${
+            session.lift?.ran
+              ? "Normalized angles are lifted against this."
+              : "Normalized angles stay withheld until a 3D lift model is imported."
+          }`;
+  const angleRows = session?.angles;
+  const seatAngles = angleRows?.filter((r) => r.seat === seat) ?? [];
+  const liftedSeatRows = seatAngles.filter((r) =>
+    ANGLE_NAMES.some((n) => r.angles[n].value !== null),
+  );
+  // A gated measure this session can actually report, and the angle behind it.
+  const reportable: Record<string, AngleName> = {
+    "Catch shin angle": "shinLeft",
+    "Catch body angle": "layback",
+    Compression: "kneeLeft",
+    "Arm extension": "elbowLeft",
+    "Layback / finish angle": "layback",
+  };
+  const metricGates = metricNames.map((name) => {
+    const angle = reportable[name];
+    const range = angle ? angleRange(seatAngles, seat, angle) : null;
+    const reported = Boolean(range && range.lo.value !== null);
+    return {
+      name,
+      reported,
+      detail: reported
+        ? `Lifted into the boat's frame: ${range!.lo.value!.toFixed(0)}–${range!.hi.value!.toFixed(0)}° over ${Math.round(range!.observedFraction * 100)}% of the seat's lifted frames.`
+        : angle
+          ? (range?.lo.reason ??
+            "Needs a solved camera and an imported 3D lift model.")
+          : name === "Split per 500 m"
+            ? "Needs calibrated speed / distance, not a panning video."
+            : "Needs validated 3D, handle/oar tracking, or phase-specific evidence.",
+    };
+  });
+  const gatesOpen = metricGates.filter((m) => m.reported).length;
   return (
     <div className="app-shell">
       <input
@@ -1151,6 +1220,178 @@ function App() {
                   )}
                   <div className="setup-step">
                     <span>03</span>
+                    <strong>Measure the boat and the lens</strong>
+                  </div>
+                  <div className="two-fields">
+                    <label>
+                      Seat spacing (m)
+                      <input
+                        type="number"
+                        step="0.01"
+                        min="0.3"
+                        max="2"
+                        placeholder="0.90"
+                        disabled={busy || !!session}
+                        value={calibration.seatSpacing ?? ""}
+                        onChange={(e) =>
+                          setCalibration({
+                            ...calibration,
+                            seatSpacing:
+                              e.target.value === "" ? null : +e.target.value,
+                          })
+                        }
+                      />
+                    </label>
+                    <label>
+                      Lens ({lensMode === "px" ? "px" : "35 mm eq."})
+                      <input
+                        type="number"
+                        step="0.1"
+                        min="1"
+                        placeholder={lensMode === "px" ? "1800" : "26"}
+                        disabled={busy || !!session}
+                        value={
+                          (lensMode === "px"
+                            ? calibration.focalPx
+                            : calibration.focal35mm) ?? ""
+                        }
+                        onChange={(e) => {
+                          const v =
+                            e.target.value === "" ? null : +e.target.value;
+                          setCalibration({
+                            ...calibration,
+                            focalPx: lensMode === "px" ? v : null,
+                            focal35mm: lensMode === "px" ? null : v,
+                          });
+                        }}
+                      />
+                    </label>
+                  </div>
+                  <div className="lens-mode">
+                    <button
+                      disabled={busy || !!session}
+                      className={lensMode === "35mm" ? "active" : ""}
+                      onClick={() => setLensMode("35mm")}
+                    >
+                      35 mm equivalent
+                    </button>
+                    <button
+                      disabled={busy || !!session}
+                      className={lensMode === "px" ? "active" : ""}
+                      onClick={() => setLensMode("px")}
+                    >
+                      Focal length in pixels
+                    </button>
+                  </div>
+                  <label className="confirm-field">
+                    <input
+                      type="checkbox"
+                      disabled={busy || !!session}
+                      checked={calibration.axisVerified === true}
+                      onChange={(e) =>
+                        setCalibration({
+                          ...calibration,
+                          axisVerified: e.target.checked,
+                        })
+                      }
+                    />
+                    <span>
+                      <strong>The bow direction above is right</strong>
+                      <small>
+                        Seat 1 is the bow seat. If this is the wrong way round
+                        the solve comes out mirrored, and it says so instead of
+                        reporting angles from a boat that does not exist.
+                      </small>
+                    </span>
+                  </label>
+                  <label className="confirm-field">
+                    <input
+                      type="checkbox"
+                      disabled={busy || !!session}
+                      checked={calibration.level === true}
+                      onChange={(e) =>
+                        setCalibration({
+                          ...calibration,
+                          level: e.target.checked,
+                        })
+                      }
+                    />
+                    <span>
+                      <strong>The horizon in this clip is level</strong>
+                      <small>
+                        The boat's vertical is the camera's vertical only if the
+                        camera was not rolled. Nothing a crew does on camera can
+                        say whether it was, so this is asked, not inferred.
+                      </small>
+                    </span>
+                  </label>
+                  <details className="rigging advanced-calibration">
+                    <summary>
+                      Principal point and 3D lift <ChevronDown size={12} />
+                    </summary>
+                    <div>
+                      <label>
+                        Principal point x (px)
+                        <input
+                          type="number"
+                          step="1"
+                          placeholder="frame centre"
+                          disabled={busy || !!session}
+                          value={calibration.cx ?? ""}
+                          onChange={(e) =>
+                            setCalibration({
+                              ...calibration,
+                              cx:
+                                e.target.value === "" ? null : +e.target.value,
+                            })
+                          }
+                        />
+                      </label>
+                      <label>
+                        Principal point y (px)
+                        <input
+                          type="number"
+                          step="1"
+                          placeholder="frame centre"
+                          disabled={busy || !!session}
+                          value={calibration.cy ?? ""}
+                          onChange={(e) =>
+                            setCalibration({
+                              ...calibration,
+                              cy:
+                                e.target.value === "" ? null : +e.target.value,
+                            })
+                          }
+                        />
+                      </label>
+                      <label>
+                        3D lift model (.onnx)
+                        <input
+                          type="file"
+                          accept=".onnx,application/octet-stream"
+                          disabled={busy || !!session}
+                          onChange={(e) => {
+                            setLiftFile(e.target.files?.[0] ?? null);
+                            e.target.value = "";
+                          }}
+                        />
+                        <small>
+                          {liftFile
+                            ? `${liftFile.name} · ${mb(liftFile.size)}`
+                            : "None. No lift weights are bundled or downloaded: a rowing-validated 3D lift does not exist yet, so normalized angles stay withheld without one you import."}
+                        </small>
+                      </label>
+                    </div>
+                  </details>
+                  <p className="calibration-note">
+                    A rigging tape gives the spacing; a phone's camera app gives
+                    the 35 mm equivalent. With both, the hips of three or more
+                    seats solve the camera. A shell axis in the image alone does
+                    not determine an azimuth, so without them nothing is
+                    guessed.
+                  </p>
+                  <div className="setup-step">
+                    <span>04</span>
                     <strong>Accuracy over speed</strong>
                   </div>
                   <button
@@ -1184,18 +1425,27 @@ function App() {
                   <div className="camera-status">
                     <div>
                       <Focus size={15} />
-                      <strong>Camera azimuth</strong>
-                      <span>
-                        {session?.camera.source === "synthetic"
-                          ? "0° · demo"
-                          : "Unresolved"}
-                      </span>
+                      <strong>Camera</strong>
+                      <span>{cameraLabel}</span>
                     </div>
-                    <p>
-                      {session?.camera.source === "synthetic"
-                        ? "Known generated view · 100% synthetic certainty."
-                        : `Confidence ${Math.round((session?.camera.confidence || 0) * 100)}%. 3D angles stay withheld until validated calibration is available.`}
-                    </p>
+                    <p>{cameraCopy}</p>
+                    {cam?.cues?.length ? (
+                      <details className="cue-list">
+                        <summary>
+                          {cam.cues.length} cues behind this solve
+                          <ChevronDown size={12} />
+                        </summary>
+                        <div>
+                          {cam.cues.map((c) => (
+                            <div key={c.name}>
+                              <span>{c.name}</span>
+                              <strong>{Math.round(c.confidence * 100)}%</strong>
+                              <small>{c.detail}</small>
+                            </div>
+                          ))}
+                        </div>
+                      </details>
+                    ) : null}
                   </div>
                   {busy ? (
                     <div className="progress-block">
@@ -1388,9 +1638,30 @@ function App() {
                           <div className="insight-tip">
                             <Focus size={18} />
                             <span>
-                              <strong>Angles need context.</strong> Layback,
-                              compression, trunk twist, and oar angles are
-                              withheld without reliable 3D calibration.
+                              {liftedSeatRows.length ? (
+                                <>
+                                  <strong>
+                                    Angles are in the boat's frame.
+                                  </strong>{" "}
+                                  {liftedSeatRows.length} of this seat's frames
+                                  were lifted against the solved camera, so
+                                  layback, hip and thigh angles no longer depend
+                                  on where the launch was sitting. They are
+                                  inferences about depth, not observations. Oar
+                                  angles, handle path, boat set and split per
+                                  500 m stay withheld.
+                                </>
+                              ) : (
+                                <>
+                                  <strong>Angles need context.</strong>{" "}
+                                  {session.lift?.ran
+                                    ? (session.lift.reason ??
+                                      "The lift refused every frame of this seat.")
+                                    : session.camera.azimuth === null
+                                      ? session.camera.reason
+                                      : "The camera is solved, but no 3D lift weights were provided. Layback, compression, trunk twist and oar angles stay withheld."}
+                                </>
+                              )}
                             </span>
                           </div>
                         </>
@@ -1435,12 +1706,22 @@ function App() {
                               : "Cycle events are body-motion proxies. Check the video before interpreting them as catch or release."}
                           </p>
                         </div>
-                        <button
-                          className="button"
-                          onClick={() => exportCSV(session)}
-                        >
-                          <Download size={14} /> CSV
-                        </button>
+                        <div className="export-buttons">
+                          <button
+                            className="button"
+                            onClick={() => exportCSV(session)}
+                          >
+                            <Download size={14} /> CSV
+                          </button>
+                          {angleRows?.length ? (
+                            <button
+                              className="button"
+                              onClick={() => exportAnglesCSV(session)}
+                            >
+                              <Download size={14} /> Angles CSV
+                            </button>
+                          ) : null}
+                        </div>
                       </div>
                       <div className="table-scroll">
                         {tab === "Crew timing" ? (
@@ -1527,22 +1808,189 @@ function App() {
                           a zero measurement.
                         </p>
                       )}
+                      {angleRows?.length ? (
+                        <div className="angles-block">
+                          <div className="angles-heading">
+                            <h3>Normalized angles · seat {seat}</h3>
+                            <span className="tag">
+                              {liftedSeatRows.length
+                                ? "LIFTED · INFERRED"
+                                : "WITHHELD"}
+                            </span>
+                          </div>
+                          <p className="note">
+                            {session.lift?.ran
+                              ? `${session.lift.placed ?? 0} of ${session.lift.attempted ?? 0} poses were placed against the solved camera${
+                                  session.lift.refused
+                                    ? `, ${session.lift.refused} refused`
+                                    : ""
+                                }${
+                                  session.lift.reprojection
+                                    ? `, median reprojection ${session.lift.reprojection.toFixed(1)} px`
+                                    : ""
+                                }. ${session.lift.model ?? ""} Every lifted
+                                joint is an inference about depth: the model was
+                                checked against the keypoints it was fitted to,
+                                and a joint the 2D pipeline discarded is never
+                                lifted.`
+                              : (session.lift?.reason ??
+                                "No lift ran on this session.")}
+                          </p>
+                          {liftedSeatRows.length ? (
+                            <>
+                              <div className="table-scroll">
+                                <table>
+                                  <thead>
+                                    <tr>
+                                      <th>Stroke</th>
+                                      <th>Catch thigh</th>
+                                      <th>Catch shin</th>
+                                      <th>Catch knee</th>
+                                      <th>Catch layback</th>
+                                      <th>Finish knee</th>
+                                      <th>Finish hip</th>
+                                      <th>Finish layback</th>
+                                      <th>Finish elbow</th>
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    {rows
+                                      .filter((r) => r.seat === seat)
+                                      .map((r) => {
+                                        const ev = anglesAtStroke(
+                                          seatAngles,
+                                          r,
+                                        );
+                                        const cell = (m: {
+                                          value: number | null;
+                                          confidence: number;
+                                          reason?: string;
+                                        }) =>
+                                          m.value === null ? (
+                                            <td
+                                              className="withheld-cell"
+                                              title={m.reason}
+                                            >
+                                              —
+                                            </td>
+                                          ) : (
+                                            <td>
+                                              {m.value.toFixed(0)}°
+                                              <i>
+                                                {Math.round(m.confidence * 100)}
+                                                %
+                                              </i>
+                                            </td>
+                                          );
+                                        return (
+                                          <tr key={`${r.seat}-${r.index}`}>
+                                            <td>{r.index}</td>
+                                            {cell(ev.atCatch.thighLeft)}
+                                            {cell(ev.atCatch.shinLeft)}
+                                            {cell(ev.atCatch.kneeLeft)}
+                                            {cell(ev.atCatch.layback)}
+                                            {cell(ev.atFinish.kneeLeft)}
+                                            {cell(ev.atFinish.hipLeft)}
+                                            {cell(ev.atFinish.layback)}
+                                            {cell(ev.atFinish.elbowLeft)}
+                                          </tr>
+                                        );
+                                      })}
+                                  </tbody>
+                                </table>
+                              </div>
+                              <div className="table-scroll">
+                                <table>
+                                  <thead>
+                                    <tr>
+                                      <th>Angle</th>
+                                      <th>5th</th>
+                                      <th>95th</th>
+                                      <th>Lifted frames</th>
+                                      <th>Confidence</th>
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    {ANGLE_NAMES.map((n: AngleName) => {
+                                      const range = angleRange(
+                                        seatAngles,
+                                        seat,
+                                        n,
+                                      );
+                                      return (
+                                        <tr key={n}>
+                                          <td title={ANGLE_LABELS[n]}>
+                                            {ANGLE_LABELS[n]}
+                                          </td>
+                                          <td>
+                                            {range.lo.value === null
+                                              ? "—"
+                                              : `${range.lo.value.toFixed(0)}°`}
+                                          </td>
+                                          <td>
+                                            {range.hi.value === null
+                                              ? "—"
+                                              : `${range.hi.value.toFixed(0)}°`}
+                                          </td>
+                                          <td>
+                                            {Math.round(
+                                              range.observedFraction * 100,
+                                            )}
+                                            %
+                                          </td>
+                                          <td>
+                                            {range.lo.value === null ? (
+                                              <span
+                                                className="withheld-cell"
+                                                title={range.lo.reason}
+                                              >
+                                                Withheld
+                                              </span>
+                                            ) : (
+                                              <span className="confidence-badge">
+                                                {Math.round(
+                                                  range.lo.confidence * 100,
+                                                )}
+                                                %
+                                              </span>
+                                            )}
+                                          </td>
+                                        </tr>
+                                      );
+                                    })}
+                                  </tbody>
+                                </table>
+                              </div>
+                              <p className="note">
+                                Left side shown; the angles CSV carries both.
+                                Interior angles read 180° when the joint is
+                                straight. Layback is negative forward of the
+                                boat's vertical, positive past it.
+                              </p>
+                            </>
+                          ) : null}
+                        </div>
+                      ) : null}
                       <details className="metric-gates">
                         <summary>
                           <ShieldCheck size={15} /> Biomechanics & observability{" "}
-                          <span>18 evidence-gated measures</span>
+                          <span>
+                            {metricNames.length - gatesOpen} of{" "}
+                            {metricNames.length} evidence-gated measures still
+                            withheld
+                          </span>
                           <ChevronDown size={15} />
                         </summary>
                         <div>
-                          {metricNames.map((m) => (
-                            <div key={m}>
-                              <span>{m}</span>
-                              <strong>Withheld · 0%</strong>
-                              <small>
-                                {m === "Split per 500 m"
-                                  ? "Needs calibrated speed / distance, not a panning video."
-                                  : "Needs validated 3D, handle/oar tracking, or phase-specific evidence."}
-                              </small>
+                          {metricGates.map((m) => (
+                            <div key={m.name}>
+                              <span>{m.name}</span>
+                              <strong>
+                                {m.reported
+                                  ? "Lifted · reported"
+                                  : "Withheld · 0%"}
+                              </strong>
+                              <small>{m.detail}</small>
                             </div>
                           ))}
                         </div>

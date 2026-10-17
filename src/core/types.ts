@@ -1,5 +1,6 @@
 import type { TtaMode } from "./tta";
 import type { PerformanceReport } from "./perf";
+import type { AngleFrame } from "./angles";
 
 /** Latest processed frame only; bitmap ownership stays with the UI coordinator. */
 export interface LivePreview {
@@ -143,6 +144,26 @@ export interface CameraSolve extends CameraEstimate {
   /** The cues behind the answer, including the ones that argued with it. */
   cues?: CameraCue[];
 }
+/**
+ * What produced a session's lifted angles, or why there are none.
+ *
+ * A lift is an inference about depth that no image can confirm on its own, so
+ * the session records which model ran, how many frames it was asked about, how
+ * many it placed, how many it refused and why. "No angles" is an answer with a
+ * reason, not a blank.
+ */
+export interface LiftProvenance {
+  ran: boolean;
+  /** Model description, when one ran. */
+  model?: string;
+  /** Why it did not run, or why the frames it refused were refused. */
+  reason?: string;
+  attempted?: number;
+  placed?: number;
+  refused?: number;
+  /** Median reprojection error over the placed frames, pixels. */
+  reprojection?: number | null;
+}
 export interface Correction {
   seat: number;
   time: number;
@@ -165,6 +186,16 @@ export interface Session {
   /** Boat and camera measurements the solve was given; absent on sessions
    * saved before it existed, which is why the solve abstains on them. */
   calibration?: BoatCalibration;
+  /**
+   * Normalized joint angles from a calibrated 3D lift, one row per entry of
+   * `frames`, in the same order. Absent when the lift did not run or the camera
+   * was not solved, and on sessions saved before it existed. Every value in a
+   * row is either an angle in the boat's frame or a withheld metric with its
+   * reason; nothing here is an observation of depth.
+   */
+  angles?: AngleFrame[];
+  /** What produced `angles`, or why there are none. */
+  lift?: LiftProvenance;
   corrections: Correction[];
   warnings: string[];
   model: string;
