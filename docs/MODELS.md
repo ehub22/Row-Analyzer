@@ -60,6 +60,36 @@ _Every frame_ is the default for fresh person detection. Experimental _Auto_ sta
 
 On the water the feet (ankles 15–16, feet 17–22) are below the gunwale for the whole clip, so whatever the model returns for them is a guess. When the session declares them hidden, the worker replaces them with missing joints flagged _Feet hidden by the hull_ before tracking, and stroke cycles use hips and knees only. A manually placed foot point is kept. Choose _Visible_ for ergometer or overhead footage. A COCO-17 model may estimate visible ankles 15–16 but **never supplies toe/heel joints 17–22**, regardless of camera setup; those slots stay unavailable unless manually labeled.
 
+### 3D lift (optional, and nothing to download)
+
+A normalized angle needs a pose in the boat's frame, and a 2D model cannot give
+one: no monocular image determines depth. `src/core/lift.ts` places a learned 3D
+lift against the camera solve, so the contract a model has to meet is narrow and
+checked rather than assumed:
+
+- **Output**: 17 joints in the COCO body order (the first 17 of COCO-WholeBody),
+  camera-frame **metres**, **root relative**, x to the image's right, y **up**, z
+  **away from** the camera. Interleaved `[1, 17, 3]` or planar `[1, 3, 17]`; a
+  per-joint confidence tensor of length 17 is used when present. Anything else is
+  refused naming the shape that arrived.
+- **Input**: the same CHW float32 crop raster the pose model gets, at the
+  configured pose input size, never flipped.
+- **What is checked**: the lifted pose is scaled and slid to land on the observed
+  keypoints through the calibrated camera. A reprojection worse than 6% of the
+  crop height is refused; a fitted scale implying a thigh outside 30–62 cm is
+  refused; a joint the 2D pipeline discarded is never lifted.
+- **What cannot be checked**: the sign of the depth axis. A rower is nearly
+  planar and nearly parallel to the image plane, so a z-flipped model reprojects
+  almost as well and its interior angles are unchanged. Verify the convention
+  once against a known-good release before trusting a new one.
+
+No lift weights are bundled and no download URL is configured, because no
+rowing-validated 3D lift has been evaluated: import a `.onnx` under _Principal
+point and 3D lift_ in the setup panel. Without one, and without a seat spacing, a
+lens and a level confirmation, normalized angles stay withheld and the session
+records which of those was missing. The lift's own accuracy is ROADMAP milestone
+8's gate, and it needs an annotated rowing benchmark, not a simulator.
+
 ### Knees at the finish
 
 The knee is the joint stroke timing is built on, and it is the one the boat covers: with the legs flat it drops to the gunwale, and in a side view the loom crosses the legs on the way out. A whole-body model does not say it cannot see it — it reports the hull edge (a knee pinned to the lowest line it could lie on) or the shaft (a knee dragged up onto the oar), at confidences that overlap a genuinely visible knee's. So the worker judges each seat's knees against that seat's own clear view of them near the catch, where neither occluder reaches: below that band, a stretch of frames measuring weaker than the reference — lower confidence, or an apparent thigh too far off the seat's own — is discarded as occlusion and flagged _Knee behind the gunwale or the oar at the finish_. A discarded knee is a missing point: not tracked, not gap-filled, not drawn, and not counted as evidence the model failed to find; the finish is timed from the bridged trough instead. The catch end of the stroke keeps exactly what the model reported, a manually placed knee is kept, footage whose knees the model already drops is left alone, and with _Feet in view: Visible_ (ergometer, overhead) the pass does not run at all. A model does not answer the same covered knee the same way twice, so a crossing it answers inconsistently — a guess on one frame, nothing on the next — is still read as one window, and a crossing it dropped throughout is left alone: there is nothing in it to discard. Both occluders and all three behaviours are simulated and pinned in `tests/knees.test.ts`; what a real weight does with a covered knee, and how far off it puts it, is not measured.

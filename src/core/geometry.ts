@@ -96,11 +96,14 @@ export function metricVisibility(camera: CameraEstimate): {
   reason: string;
 } {
   return {
+    // Magnitude, not sign: a negative azimuth is a real answer — the bow end
+    // was the nearer one — and is no less usable than a positive one, while one
+    // beyond 60° either way is too foreshortened to lift against.
     allowed:
       camera.source === "calibrated" &&
       camera.confidence >= 0.8 &&
       camera.azimuth !== null &&
-      camera.azimuth < 60,
+      Math.abs(camera.azimuth) < 60,
     reason:
       "Needs validated 3D pose and camera calibration. Film alongside, near perpendicular to the shell, with the whole rower visible.",
   };

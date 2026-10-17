@@ -60,7 +60,7 @@ import type {
 } from "./types";
 import { seen } from "./occlusion";
 import { HIP_JOINTS } from "./strokes";
-import { median, solveLinear3 } from "./geometry";
+import { median, metricVisibility, solveLinear3 } from "./geometry";
 
 /** Hips are the joint the seat line is read from: the one joint that stays
  * above the gunwale all stroke, and the seat's own position along the shell. */
@@ -508,19 +508,20 @@ function stability(
 /**
  * Whether normalized angles may be reported from this solve.
  *
- * The bar is the one `metricVisibility` in core/geometry.ts set: a calibrated
- * source, real confidence, an azimuth shallow enough that the lift is not being
- * asked to see along its own depth axis, and the scale that turns a lifted pose
- * into metres.
+ * The bar is `metricVisibility`'s — a calibrated source, real confidence, an
+ * azimuth shallow enough that a lift is not being asked to see along its own
+ * depth axis — so there is one definition of "validated enough" in the repo
+ * rather than two that can drift. On top of it, a solve has to carry the depth
+ * and the scale that place a lifted pose at all.
  */
 export function solveAllowsAngles(solve: CameraSolve): boolean {
   return (
-    solve.source === "calibrated" &&
-    solve.confidence >= 0.8 &&
-    solve.azimuth !== null &&
-    Math.abs(solve.azimuth) < MAX_AZIMUTH &&
+    metricVisibility(solve).allowed &&
+    Math.abs(solve.azimuth ?? 90) < MAX_AZIMUTH &&
     solve.distance !== null &&
-    solve.pxPerMetre !== null
+    solve.distance !== undefined &&
+    solve.pxPerMetre !== null &&
+    solve.pxPerMetre !== undefined
   );
 }
 

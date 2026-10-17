@@ -47,12 +47,14 @@ Automatic multi-cue camera estimation is a research milestone, not a solved cons
 
 Known shell length, rigger spread and oar length constrain scale only with valid projections/calibration. An eight has no single exact standard length; use a manufacturer/user value (roughly 17–18 m as guidance, not ground truth). Do not derive split per 500 m from panning video. A genuine 3D lifting model and camera solution are prerequisites for normalized trunk, shin, knee, hip, elbow, shoulder, head, and oar angles. Withhold these until then. Synthetic projection tests validate the geometry implementation, not monocular depth recovery.
 
+What exists now is a **user-assisted solve**, not the automatic one above, and the distinction is the design. `src/core/camera.ts` reads the crew's own seat line: seats lie on one straight line at a spacing a rigging tape supplies, so a pinhole camera maps them through `u(x) = (a·x + b)/(c·x + 1)`, and three seats fix it. Its vanishing point with a focal length and a principal point gives the azimuth; `c` gives the depth of the seat line's centre; `a − b·c` the image scale along the shell. The cues that do not exist are declared rather than approximated — the principal point is not in the seat line (`b` is only the image column of the line's own origin), the fit is invariant to the spacing's scale, and roll is not observable from a crew at all, so a level clip is something the user confirms. An azimuth is reported only when the cues agree, and `solveAllowsAngles` keeps the same bar `metricVisibility` set. Automatic multi-cue estimation from hull lines, oars and compensated flow stays a research milestone.
+
 ## Milestones and acceptance tests
 
 1. **Foundation**: accessible workbench, roadmap, private upload, source playback, frame navigation, boat/rigging setup, clearly marked synthetic demo. Verify build and UI.
 2. **Decode/inference**: WebCodecs worker, bounded frame queue, cancellable progress, detector and whole-body ONNX adapters, GPU/WASM fallback, padded crops, flip + multi-scale TTA and sub-pixel decoding. Test tensor decoding/crop mapping and actual clip decode. Accuracy claims require real weights and labels.
 3. **Seat/occlusion**: stable seat slots, gated global assignment, missing tracks, short-gap completion, jump flags, manual correction and local propagation. Test masking and crossing/ambiguity fixtures.
-4. **Geometry**: camera confidence and abstention; tested boat-frame transforms and scale utilities. Full automatic camera solve and temporal 3D lift stay gated until validated. Test many synthetic viewpoints.
+4. **Geometry**: camera confidence and abstention; tested boat-frame transforms and scale utilities. A user-assisted seat-line camera solve and a single-frame 3D lift placed against it are implemented and tested on synthetic viewpoints (see _3D analysis_ below). Full automatic camera solve and temporal 3D lift stay gated until validated. Test many synthetic viewpoints.
 5. **Analysis**: cycle segmentation, rate, ratio, evidence gating, crew catch/finish synchronization and phase. Single-seat sweep/scull overlays; withhold unsupported biomechanics and oar metrics. Test synthetic rates, lag, incomplete strokes and missing evidence.
 6. **Review/export**: corrections/training labels, comparison, per-stroke tables, CSV/JSON/PDF; verify exports preserve confidence and warnings. Camera-position guidance built in.
 7. **Validation/deployment**: private Drive samples kept ignored; record decode and tracking validation separately. CI typecheck/test/build; GitHub Pages Actions deployment from the session branch. Verify workflow outcome and publish URL.
@@ -379,3 +381,106 @@ Still open, in rough order of expected value:
   in the TTA gate; a **fused joint** is labelled observed whenever one pass
   cleared 0.3, even when its fused confidence is far below that (stroke timing
   checks confidence, so it is unaffected; the evidence fraction is not).
+
+## 3D analysis (2026-10-17)
+
+Normalized angles were the gated half of milestone 4 and the lift adapter of
+milestone 8. Both are implemented now, in the only form the evidence supports:
+a camera solve the user assists and can audit, a single-frame lift that is
+checked against the keypoints it was fitted to, and angles that are either in
+the boat's frame or withheld with a reason. Nothing here claims that monocular
+depth has been recovered.
+
+Implemented:
+
+- **A true-3D fixture** (`tests/fixtures/rowingSim3d.ts`): the existing 2D
+  kinematics, unchanged and imported rather than copied, in boat-frame metres —
+  x along the shell towards the rowers' feet, y up, z to a rower's right — with
+  a crew seated along it, hip and shoulder widths, boat surge, keypoint noise
+  scaled to the crop, hidden feet and a pinhole camera with a focal length, an
+  azimuth, a distance, a height and a principal point. Per-frame truth carries
+  boat-frame joints, projected pixels and the hip-midpoint depth. An
+  `azimuthDrift` option turns the camera during the clip, because a launch
+  follows the shell.
+- **The seat-line solve** (`src/core/camera.ts`, `tests/camera3d.test.ts`): see
+  _Camera normalization and scale_ above for the geometry and what it cannot
+  give. It abstains on a square-on view (no perspective in the spacing at all),
+  on one so nearly square that the turn is inside the keypoint noise, without a
+  spacing or a lens, without the level confirmation, on a mirrored clip, on a
+  bow direction that contradicts the hips, on a seat line that does not fit one
+  equally spaced straight line, and on a clip whose two halves solve to
+  different azimuths. Recovered azimuths are within 0.15° of the truth at 10,
+  18, 30 and 45° off square.
+- **Normalized angles** (`src/core/angles.ts`, `tests/angles3d.test.ts`):
+  interior knee, hip and elbow angles, thigh and shin angles from the boat's
+  vertical, and layback averaged over both shoulders so a sweep rower's twist is
+  not read as a lean. An angle whose joints were not all lifted is withheld
+  naming the joint. The thigh is reported alongside the knee because on the
+  water it is the one leg angle that is fully observed: feet are below the
+  gunwale, so the knee and shin angles do not exist there.
+- **The lift adapter** (`src/core/lift.ts`, `tests/lift3d.test.ts`): places a
+  learned lift against the solve by fitting the scale and the in-plane position
+  that make the lifted pose land on the observed keypoints through the
+  calibrated camera, with the depth taken from the calibration rather than
+  invented. It refuses a pose that does not land (naming the reprojection in
+  pixels), a scale that implies an impossible segment length (naming it in
+  centimetres), an output whose shape it does not recognize (naming the shape),
+  and too few observed joints to place anything. A discarded keypoint stays
+  discarded: the lift never resurrects a knee the gunwale hid.
+- **Plumbing**: `Session.camera` is the solve, `Session.calibration` what the
+  user measured, `Session.angles` one row per frame aligned to `frames`, and
+  `Session.lift` what produced them or why nothing did. The lift runs as a
+  second decode pass, only when a solve and imported weights both exist. The
+  setup panel asks for the spacing, the lens and the two confirmations; the
+  camera panel shows the cues or the abstention; exports carry the angles, with
+  `withheld` written out rather than left blank.
+
+Measured, over every lifted frame of one seat (8 s clips, 24 spm, eight seats,
+1800 px lens, 16 m out):
+
+| Camera off square | Knee error, measured in the image | Knee error, lifted into the boat frame | Layback error, image | Layback, lifted |
+| ----------------- | --------------------------------- | -------------------------------------- | -------------------- | --------------- |
+| 10°               | 3.8° mean, 11.8° worst            | 0.0°                                   | 5.7° worst           | 0.02° worst     |
+| 24°               | 4.4° mean, 16.7° worst            | 0.0°                                   | 8.3° worst           | 0.0° worst      |
+| 45°               | 8.6° mean, 29.4° worst            | 0.0°                                   | 14.5° worst          | 0.02° worst     |
+
+The lifted column is exact because the test's oracle _is_ the fixture's own 3D,
+so this validates the geometry implementation — projection, solve, placement,
+rotation into the boat frame, angle definitions — and says nothing about a
+lift model's accuracy on real footage. The image column is the reason to do it
+at all: the same knee, read off the pixels, is wrong by degrees at every
+azimuth a launch actually films from, and worse the further the camera is from
+the beam. No 2D cosine correction recovers that, which is what the risk
+register says.
+
+Not done, and gated:
+
+- **No lift weights exist.** Nothing is bundled and nothing downloads: the
+  adapter's contract is written (17-joint COCO body, camera-frame metres, root
+  relative, x right, y up, z away from the camera) and a model can be imported
+  locally, but no rowing-validated 3D lift has been evaluated, so normalized
+  angles stay withheld until one is. Milestone 8's benchmark is still the gate.
+- **The depth axis's sign is a contract, not a measurement.** A rower is nearly
+  planar and the plane is nearly the image plane, so flipping a lift's z
+  reprojects almost as well (6 px against a 2 px honest fit) and the interior
+  angles are unchanged because a reflection preserves them. What it would
+  corrupt is anything lateral — boat set, shoulder level, trunk twist — which is
+  exactly why those stay withheld. The convention must be checked once against a
+  known-good release, not per frame.
+- **One azimuth per clip.** The solve reports a single camera and prices the
+  assumption with a stability cue over the two halves; a launch that pans or
+  surges is not described by one azimuth, and a clip whose halves disagree more
+  than 6° is refused. Motion-compensated calibration is milestone 8.
+- **Pitch, roll and camera height are not solved.** Roll is asked for. Pitch and
+  height would need a vertical reference the crew does not provide, so anything
+  absolute in height — handle height above the water — stays withheld.
+- **Metric lengths stay withheld.** A wrong tape scales the distance and the
+  pixels-per-metre by the same factor and leaves the azimuth untouched, which is
+  why angles can be reported and lengths cannot. `pxPerMetre` is directional: it
+  is the scale along the shell axis, and a metre across the boat spans
+  `f/depth` pixels instead.
+- **The lift is single-frame.** No temporal smoothing, no bone-length priors
+  across a clip, no cyclic prior. A per-frame lift placed per-frame is what has
+  been tested; the temporal model is milestone 8.
+- **Nothing was measured on real footage.** Every number above comes from the
+  simulator, including the occlusion and noise it was told to produce.
