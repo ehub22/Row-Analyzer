@@ -3,6 +3,14 @@ import type { Session } from "./types";
 import { mean, crewTiming, segmentStrokes } from "./strokes";
 import { jointNames } from "./keypoints";
 import { MODEL_UNAVAILABLE_FLAG } from "./bodyLayout";
+import { expectedOcclusion } from "./occlusion";
+import { KNEE_JOINTS } from "./knees";
+import {
+  ANGLE_LABELS,
+  ANGLE_NAMES,
+  angleRange,
+  type AngleName,
+} from "./angles";
 export function download(
   data: BlobPart,
   name: string,
@@ -18,9 +26,50 @@ export function download(
 export const exportJSON = (session: Session) =>
   download(JSON.stringify(session), "row-analysis.json");
 export function exportCSV(s: Session) {
-  const rows = [
+  const rows: (string | number)[][] = [
     ["Source", s.demo ? "SYNTHETIC DEMO" : "Experimental video analysis"],
     ["Pose joints", s.poseJoints ?? 133],
+    // The camera, with its provenance: an exported number without the cues
+    // behind it is how a guess starts looking like a measurement.
+    [
+      "Camera azimuth (deg)",
+      s.camera.azimuth === null ? "withheld" : s.camera.azimuth.toFixed(2),
+    ],
+    ["Camera confidence", `${Math.round(s.camera.confidence * 100)}%`],
+    ["Camera source", s.camera.source],
+    [
+      "Camera distance (m)",
+      s.camera.distance === null || s.camera.distance === undefined
+        ? "withheld"
+        : s.camera.distance.toFixed(2),
+    ],
+    [
+      "Scale along the shell (px/m)",
+      s.camera.pxPerMetre === null || s.camera.pxPerMetre === undefined
+        ? "withheld"
+        : s.camera.pxPerMetre.toFixed(1),
+    ],
+    ["Seat spacing (m)", s.calibration?.seatSpacing ?? "not supplied"],
+    [
+      "Focal length (px)",
+      s.camera.focalPx ?? s.calibration?.focalPx ?? "not supplied",
+    ],
+    ["Clip confirmed level", s.calibration?.level === true ? "yes" : "no"],
+    ["Camera reason", s.camera.reason.replaceAll(",", ";")],
+    ...(s.camera.cues ?? []).map((c) => [
+      `Cue: ${c.name}`,
+      `${Math.round(c.confidence * 100)}%`,
+      c.detail.replaceAll(",", ";"),
+    ]),
+    [
+      "3D lift",
+      s.lift?.ran
+        ? `${s.lift.placed ?? 0}/${s.lift.attempted ?? 0} poses placed; ${s.lift.model ?? ""}`
+        : `not run: ${s.lift?.reason ?? "no lift on this session"}`.replaceAll(
+            ",",
+            ";",
+          ),
+    ],
     [
       "Seat",
       "Stroke",
@@ -47,6 +96,53 @@ export function exportCSV(s: Session) {
   download(
     rows.map((row) => row.join(",")).join("\n"),
     "row-strokes.csv",
+    "text/csv",
+  );
+}
+/**
+ * Per-frame normalized angles, one row per analyzed frame, aligned to the
+ * session's frames.
+ *
+ * A withheld angle is written as "withheld", never as a blank and never as a
+ * zero: a blank in a spreadsheet gets filled in by whoever opens it, and a zero
+ * is a measurement. The reason column carries the refusal, so a coach filtering
+ * the sheet can see which frames were dropped and why.
+ */
+export function exportAnglesCSV(s: Session) {
+  const rows = s.angles ?? [];
+  if (!rows.length) return;
+  const lines = [
+    [
+      "Time (s)",
+      "Seat",
+      "Reprojection (px)",
+      ...ANGLE_NAMES.map((n) => `${ANGLE_LABELS[n]} (deg)`),
+      "Withheld because",
+    ],
+    ...rows.map((r) => {
+      const reasons = [
+        ...new Set(
+          ANGLE_NAMES.map((n) => r.angles[n].reason).filter((x): x is string =>
+            Boolean(x),
+          ),
+        ),
+      ];
+      return [
+        r.time.toFixed(3),
+        r.seat,
+        r.reprojection === null ? "" : r.reprojection.toFixed(2),
+        ...ANGLE_NAMES.map((n) =>
+          r.angles[n].value === null
+            ? "withheld"
+            : r.angles[n].value!.toFixed(2),
+        ),
+        reasons.join(" | ").replaceAll(",", ";"),
+      ];
+    }),
+  ];
+  download(
+    lines.map((row) => row.join(",")).join("\n"),
+    "row-angles.csv",
     "text/csv",
   );
 }
@@ -111,11 +207,26 @@ export function exportPDF(s: Session) {
           ? "Feet: visible. The body-only model may estimate ankles; toe and heel keypoints are not provided and are never counted as model observations."
           : "Feet: visible. Ankle and foot keypoints were tracked.",
     );
+  // Counted from the frames themselves, so an imported session reports what it
+  // contains rather than trusting a claim.
+  const occludedKnees = s.frames.reduce(
+    (n, f) =>
+      n + KNEE_JOINTS.filter((j) => expectedOcclusion(f.points[j])).length,
+    0,
+  );
+  if (occludedKnees)
+    text(
+      `Knees at the finish: ${occludedKnees} knee samples were discarded as gunwale or oar occlusion and marked missing with a reason. With the legs flat the knee drops to the hull edge and the loom crosses it, and a pose model still answers - pinned to the gunwale or dragged onto the shaft - so those answers are not tracked, counted as evidence, or drawn. The catch end of the stroke is untouched; each finish proxy is timed from the bridged trough instead of from a guess.`,
+    );
   text(`Runtime: ${s.provider}`);
   text(
-    `Camera azimuth: ${s.camera.azimuth === null ? "withheld" : s.camera.azimuth + " degrees"} | confidence ${Math.round(s.camera.confidence * 100)}%`,
+    `Camera: ${s.camera.azimuth === null ? "azimuth withheld" : `${s.camera.azimuth.toFixed(1)} degrees off square, ${s.camera.azimuth > 0 ? "stern" : "bow"} end nearer`} | confidence ${Math.round(s.camera.confidence * 100)}%${
+      s.camera.distance ? ` | ${s.camera.distance.toFixed(1)} m out` : ""
+    }${s.camera.pxPerMetre ? ` | ${s.camera.pxPerMetre.toFixed(0)} px per metre along the shell` : ""}`,
   );
   text(s.camera.reason);
+  for (const c of s.camera.cues ?? [])
+    text(`Cue ${c.name} (${Math.round(c.confidence * 100)}%): ${c.detail}`, 9);
   if (s.performance) text(`Performance: ${s.performance.summary}`, 9);
   for (const w of s.warnings) text(`Caution: ${w}`, 10);
   y += 5;
@@ -143,15 +254,96 @@ export function exportPDF(s: Session) {
       `Seat ${r.seat} / stroke ${r.index}: catch ${r.catch.toFixed(3)} s, finish proxy ${r.finish.toFixed(3)} s, rate ${r.rate.value?.toFixed(1) ?? "withheld"} spm, D:R ${r.ratio.value?.toFixed(2) ?? "withheld"}, confidence ${Math.round(r.confidence * 100)}%.`,
       9,
     );
+  // Normalized angles, when a lift produced them: the seat's own range over the
+  // clip, and what was withheld, in the same place, so a reader cannot mistake
+  // one for the other.
+  const angleRows = s.angles ?? [];
+  if (angleRows.length) {
+    text("Normalized angles (boat frame)", 16);
+    text(
+      s.lift?.ran
+        ? `${s.lift.placed ?? 0} of ${s.lift.attempted ?? 0} poses were placed against the solved camera${
+            s.lift.refused ? `, ${s.lift.refused} refused` : ""
+          }${
+            s.lift.reprojection
+              ? `, median reprojection ${s.lift.reprojection.toFixed(1)} px`
+              : ""
+          }. Model: ${s.lift.model ?? "unrecorded"}. These are inferences about depth from a learned lift, checked against the keypoints they were fitted to; they are not observations, and a joint the 2D pipeline discarded was never lifted.`
+        : `No lift ran: ${s.lift?.reason ?? "unrecorded"}.`,
+      10,
+    );
+    for (let seat = 1; seat <= s.boat.seats; seat++) {
+      const seatRows = angleRows.filter((r) => r.seat === seat);
+      if (!seatRows.length) continue;
+      const parts: string[] = [];
+      const withheldParts: string[] = [];
+      for (const n of ANGLE_NAMES) {
+        const range = angleRange(seatRows, seat, n);
+        if (range.lo.value === null) withheldParts.push(ANGLE_LABELS[n]);
+        else
+          parts.push(
+            `${ANGLE_LABELS[n]} ${range.lo.value.toFixed(0)}-${range.hi.value!.toFixed(0)} deg (${Math.round(range.observedFraction * 100)}% of frames)`,
+          );
+      }
+      text(
+        `Seat ${seat}: ${parts.length ? parts.join(", ") : "nothing lifted"}.`,
+        9,
+      );
+      if (withheldParts.length)
+        text(
+          `Seat ${seat} withheld: ${withheldParts.join(", ")}. ${
+            angleRange(seatRows, seat, withheldParts[0] as AngleName).lo
+              .reason ?? ""
+          }`,
+          9,
+        );
+    }
+  }
   text("Withheld measurements", 16);
   text(
-    "Normalized shin/body/joint angles, layback, trunk twist, sequencing faults, oar angles, release quality, handle crossover/height, boat set and split per 500 m require additional validated evidence.",
+    angleRows.some((r) => r.angles.layback.value !== null)
+      ? "Trunk twist, sequencing faults, oar angles, release quality, handle crossover/height, boat set and split per 500 m require additional validated evidence: oar and handle tracking, lateral measures a lift's depth-axis convention cannot confirm, and calibrated speed rather than a panning video."
+      : "Normalized shin/body/joint angles, layback, trunk twist, sequencing faults, oar angles, release quality, handle crossover/height, boat set and split per 500 m require additional validated evidence.",
   );
   text("Camera guidance", 16);
   text(
     "Film alongside the shell, near perpendicular with a slight offset to separate rowers. Keep hands, hips, knees and the whole slide visible; on the water the feet sit below the gunwale and are not needed. For individual technique, use a closer single-seat view. Avoid bow-on footage for layback assessment.",
   );
   doc.save("row-analysis-report.pdf");
+}
+/**
+ * Lifted angle rows, checked the way frames are: an imported session is a
+ * record of a run, and the lift cannot be recomputed without its weights, so
+ * what can be checked is that every row is either an angle with a confidence or
+ * a refusal with a reason — never a number with no provenance behind it.
+ */
+function validAngles(s: Session): boolean {
+  const rows = s.angles;
+  if (rows === undefined) return !s.lift?.ran;
+  if (!Array.isArray(rows) || rows.length !== s.frames.length) return false;
+  if (!s.lift?.ran) return false;
+  return rows.every(
+    (r, i) =>
+      r &&
+      r.time === s.frames[i]!.time &&
+      r.seat === s.frames[i]!.seat &&
+      (r.reprojection === null ||
+        (Number.isFinite(r.reprojection) && r.reprojection >= 0)) &&
+      !!r.angles &&
+      ANGLE_NAMES.every((n) => {
+        const m = r.angles[n];
+        return (
+          !!m &&
+          typeof m.unit === "string" &&
+          Number.isFinite(m.confidence) &&
+          m.confidence >= 0 &&
+          m.confidence <= 1 &&
+          (m.value === null
+            ? m.confidence === 0 && typeof m.reason === "string"
+            : Number.isFinite(m.value) && m.confidence > 0)
+        );
+      }),
+  );
 }
 export function validateSession(value: unknown): Session {
   const s = value as Session;
@@ -200,11 +392,13 @@ export function validateSession(value: unknown): Session {
     !Number.isFinite(s.camera.confidence) ||
     s.camera.confidence < 0 ||
     s.camera.confidence > 1 ||
+    // Negative is a real answer: it means the bow end, not the stern end, was
+    // the nearer one. Only the size has a range.
     (s.camera.azimuth !== null &&
       (!Number.isFinite(s.camera.azimuth) ||
-        s.camera.azimuth < 0 ||
-        s.camera.azimuth > 90)) ||
-    typeof s.camera.reason !== "string"
+        Math.abs(s.camera.azimuth) > 90)) ||
+    typeof s.camera.reason !== "string" ||
+    !validAngles(s)
   )
     throw Error(
       "Invalid Row Analyzer session. Import an exported version 1 JSON session.",

@@ -153,3 +153,42 @@ test("model cache panel reports no-URL builds and keeps local import as fallback
   await expect(page.getByText("Cached model files removed.")).toBeVisible();
   await page.getByRole("button", { name: "Close dialog" }).click();
 });
+test("calibration is asked for, and a demo does not claim a solved camera", async ({
+  page,
+}) => {
+  await page.goto("/");
+  // The measurements a solve needs are asked for before anything is analyzed,
+  // and the panel says what happens without them.
+  await expect(page.getByText("Measure the boat and the lens")).toBeVisible();
+  await expect(page.getByLabel("Seat spacing (m)")).toBeVisible();
+  await expect(page.getByLabel("Lens (35 mm eq.)")).toBeVisible();
+  await page.getByLabel("Seat spacing (m)").fill("0.90");
+  await page.getByLabel("Lens (35 mm eq.)").fill("26");
+  await expect(
+    page.getByLabel("The horizon in this clip is level"),
+  ).toBeVisible();
+  await expect(page.locator(".calibration-note")).toContainText(
+    "does not determine an azimuth",
+  );
+  // No lift weights ship with the app, and the panel says so rather than
+  // offering a button that would pretend otherwise.
+  await page.getByText("Principal point and 3D lift").click();
+  await expect(page.locator(".advanced-calibration")).toContainText(
+    "a rowing-validated 3D lift does not exist yet",
+  );
+  await expect(page.locator(".camera-status")).toContainText("Not analyzed");
+  // A demo clip is a synthetic square-on view: there is no seat line to solve,
+  // so nothing is lifted and no gated measure becomes reportable.
+  await page.getByText("Explore a synthetic demo").click();
+  await expect(page.locator(".camera-status")).toContainText("0° · demo");
+  await expect(page.locator(".camera-status")).toContainText(
+    "no seat line to solve",
+  );
+  await expect(page.locator(".angles-block")).toHaveCount(0);
+  await expect(page.locator(".metric-gates summary")).toContainText(
+    "18 of 18 evidence-gated measures still withheld",
+  );
+  await expect(page.locator(".insight-tip")).toContainText(
+    "Angles need context",
+  );
+});

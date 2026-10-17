@@ -6,7 +6,12 @@
 // like noise, and the feet — strapped to the stretcher below the gunwale —
 // are *not visible*, so the model's ankle/foot outputs are hallucinations
 // (or dropped; `feet: "visible"` models erg footage). Optionally the hull
-// also hides the knees whenever they drop below the saxboard (`kneeGunwale`).
+// also hides the knees whenever they drop below the saxboard (`kneeGunwale`),
+// and optionally the oar loom crosses them near the finish (`oarKnee`): both
+// are what a rower filming from a launch actually sees at the finish.
+// `truth` carries the noise-free hip and knee positions and which occluder
+// covered the knee, so tests can measure keypoint error directly instead of
+// only cycle timing.
 //
 // Kinematics (boat frame, metres, +x towards the feet/stern, +y up):
 //  * the ankle is fixed to the foot stretcher (origin);
@@ -56,7 +61,7 @@ export function legExtension(phase: number) {
   return 1 - ease((phase - 0.55) / 0.45); // slide forward to the next catch
 }
 /** Trunk layback in degrees (negative = leaning towards the feet). */
-function trunkAngle(phase: number) {
+export function trunkAngle(phase: number) {
   if (phase < 0.12) return -28;
   if (phase < 0.38) return -28 + 50 * ease((phase - 0.12) / 0.26);
   if (phase < 0.45) return 22;
@@ -64,7 +69,7 @@ function trunkAngle(phase: number) {
   return -28;
 }
 /** Arm draw: 0 = arms straight, 1 = handle at the body. */
-function armDraw(phase: number) {
+export function armDraw(phase: number) {
   if (phase < 0.26) return 0;
   if (phase < 0.4) return ease((phase - 0.26) / 0.14);
   if (phase < 0.42) return 1;
@@ -173,11 +178,38 @@ export interface SimOptions {
    */
   kneeGunwale?: number;
   /** What the model does with a knee behind the hull: drop it (confidence
-   * below 0.3 every frame) or place it on the gunwale edge with moderate
-   * confidence. */
-  kneeHidden?: "dropout" | "snap";
+   * below 0.3 every frame), place it on the gunwale edge with moderate
+   * confidence, or answer a fresh coin flip between the two every frame — a
+   * model does not treat the same covered knee the same way twice. */
+  kneeHidden?: "dropout" | "snap" | "mixed";
+  /**
+   * The oar. Near the finish the loom crosses the legs in a side view, so the
+   * knee is behind it for part of every cycle: this is the fraction of the
+   * cycle it covers, centred on the finish (phase 0.45). Undefined/0: no oar
+   * occlusion.
+   */
+  oarKnee?: number;
+  /** What the model does with a knee behind the loom: drop it, report the knee
+   * where the shaft is (the classic "latched onto the oar" answer), or a
+   * per-frame coin flip between the two. */
+  oarHidden?: "dropout" | "drag" | "mixed";
   seat?: number;
   rower?: Partial<Rower>;
+}
+
+/** What the rower was actually doing on one frame (fixture ground truth). */
+export interface SimTruth {
+  time: number;
+  phase: number;
+  /** Leg extension: 0 at the catch, 1 once the legs are flat. */
+  extension: number;
+  /** Image-space position of the near-side hip and knee, noise free. */
+  hip: V;
+  knee: V;
+  /** The hull edge hid the knee on this frame. */
+  hullHidKnee: boolean;
+  /** The oar loom hid the knee on this frame. */
+  oarHidKnee: boolean;
 }
 
 export interface SimResult {
@@ -185,6 +217,8 @@ export interface SimResult {
   /** True catch times (phase 0). */
   catches: number[];
   period: number;
+  /** Per-frame ground truth, same length and order as `frames`. */
+  truth: SimTruth[];
 }
 
 /** COCO-WholeBody: ankles 15/16, feet 17–22. */
@@ -215,9 +249,12 @@ export function simulateRower(options: SimOptions = {}): SimResult {
   const F = rng(o.seed ^ 0x9e3779b9);
   // Hull occlusion of the knees likewise has its own stream.
   const K = rng(o.seed ^ 0x51ed27);
+  // …and so does the oar, so that adding it does not perturb the hull's draws.
+  const O = rng(o.seed ^ 0x1b873593);
   const period = 60 / o.rate;
   const sign = o.feetToRight ? 1 : -1;
   const frames: PoseFrame[] = [];
+  const truth: SimTruth[] = [];
   const catches: number[] = [];
   for (let t = o.offset; t < o.seconds; t += period) catches.push(t);
   // Temporally correlated hallucination state (models answer smoothly to
@@ -298,17 +335,62 @@ export function simulateRower(options: SimOptions = {}): SimResult {
     pair(13, img.knee);
     for (const j of [13, 14])
       if (R.next() < o.kneeDropout) points[j] = missing();
-    if (
-      o.kneeGunwale !== undefined &&
-      p.knee.y < r.hipAboveAnkle + o.kneeGunwale
-    ) {
-      const edge = toImage({ x: 0, y: r.hipAboveAnkle + o.kneeGunwale }).y;
+    const hullHidKnee =
+      o.kneeGunwale !== undefined && p.knee.y < r.hipAboveAnkle + o.kneeGunwale;
+    if (hullHidKnee) {
+      const edge = toImage({ x: 0, y: r.hipAboveAnkle + o.kneeGunwale! }).y;
+      // One answer per frame, not per joint: both knees are behind the same
+      // gunwale, and "mixed" re-decides every frame.
+      const snap =
+        o.kneeHidden === "snap" || (o.kneeHidden === "mixed" && K.next() < 0.5);
       for (const j of [13, 14]) {
-        const snap = o.kneeHidden === "snap";
         const conf = snap ? K.uniform(0.3, 0.6) : K.uniform(0.02, 0.28);
         points[j] = {
           x: img.knee.x + (j - 13) * 4 + K.gauss() * sd * 2,
           y: (snap ? edge : img.knee.y) + K.gauss() * sd * 2,
+          confidence: conf,
+          origin: conf >= 0.3 ? "observed" : "missing",
+        };
+      }
+    }
+    // The oar: near the finish the loom crosses the legs, so the knee is
+    // behind it for a window of every cycle centred on phase 0.45.
+    const oarHidKnee =
+      !!o.oarKnee &&
+      Math.abs(((phase - 0.45 + 1.5) % 1) - 0.5) <= o.oarKnee / 2;
+    if (oarHidKnee) {
+      // The shaft only covers the knee when it passes within a few centimetres
+      // of it, so what the model reports is the knee pulled onto the shaft —
+      // a few centimetres across it, plus a slide along it — not a joint
+      // teleported to the handle. The shaft's image angle swinging with the
+      // stroke, and the size of both displacements, are assumptions of this
+      // fixture, not measurements of a boat.
+      const theta = 38 + 14 * Math.sin(2 * Math.PI * phase);
+      const a = rad(sign > 0 ? theta : 180 - theta);
+      const ux = Math.cos(a),
+        uy = Math.sin(a);
+      // Normal to the shaft, pointing up in the image: the loom crosses over
+      // the legs, so a knee reported on it sits above the real one.
+      const nx = uy,
+        ny = -ux;
+      const dragged =
+        o.oarHidden === "drag" || (o.oarHidden === "mixed" && O.next() < 0.5);
+      for (const j of [13, 14]) {
+        const across = O.uniform(0.02, 0.09) * o.scale,
+          along = O.uniform(-0.05, 0.05) * o.scale,
+          pull = O.uniform(0.5, 1);
+        const conf = dragged ? O.uniform(0.35, 0.78) : O.uniform(0.02, 0.28);
+        const drag = dragged ? pull : 0;
+        points[j] = {
+          x:
+            img.knee.x +
+            (across * nx + along * ux) * drag +
+            (j - 13) * 4 +
+            O.gauss() * sd * 1.6,
+          y:
+            img.knee.y +
+            (across * ny + along * uy) * drag +
+            O.gauss() * sd * 1.6,
           confidence: conf,
           origin: conf >= 0.3 ? "observed" : "missing",
         };
@@ -368,6 +450,15 @@ export function simulateRower(options: SimOptions = {}): SimResult {
       );
     }
     frames.push({ time, seat: o.seat, points, box, identityConfidence: 0.92 });
+    truth.push({
+      time,
+      phase,
+      extension: p.extension,
+      hip: img.hip,
+      knee: img.knee,
+      hullHidKnee,
+      oarHidKnee,
+    });
   }
-  return { frames, catches, period };
+  return { frames, catches, period, truth };
 }

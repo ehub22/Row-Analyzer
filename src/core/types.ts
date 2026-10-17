@@ -1,5 +1,6 @@
 import type { TtaMode } from "./tta";
 import type { PerformanceReport } from "./perf";
+import type { AngleFrame } from "./angles";
 
 /** Latest processed frame only; bitmap ownership stays with the UI coordinator. */
 export interface LivePreview {
@@ -84,6 +85,85 @@ export interface CameraEstimate {
   source: "unresolved" | "calibrated" | "synthetic";
   axis: { x: number; y: number };
 }
+/**
+ * What the user measured or entered about the boat and the camera.
+ *
+ * The camera solve is not automatic, and ROADMAP.md says why: a shell axis in
+ * the image alone does not determine an azimuth. These are the lengths and the
+ * lens that turn the crew's own seat line into metric geometry — a rigging tape
+ * measure and a lens specification, not a calibration board. Absent or null
+ * fields are abstentions waiting to happen, and the solve reports which one.
+ */
+export interface BoatCalibration {
+  /** Seat spacing along the shell, metres, centre to centre. */
+  seatSpacing?: number | null;
+  /** Shell length bow to stern, metres. Reported, not used by the solve. */
+  shellLength?: number | null;
+  /** Focal length in pixels, when it is known directly. */
+  focalPx?: number | null;
+  /** Focal length as a 35 mm equivalent, converted with the image width. */
+  focal35mm?: number | null;
+  /** Principal point in pixels; the frame centre when unset. */
+  cx?: number | null;
+  cy?: number | null;
+  /** Camera height above the waterline, metres, for handle height. */
+  cameraHeight?: number | null;
+  /** The user checked the shell axis and which end of the image the bow is at. */
+  axisVerified?: boolean;
+  /**
+   * The user checked that the clip is level, so the camera's vertical is the
+   * boat's. Nothing a crew does on camera can say whether it is, and a rolled
+   * clip tilts every lifted angle by however far the horizon is off.
+   */
+  level?: boolean;
+}
+/** One measurement behind a camera solve: what it was, and how far it is
+ * trusted. Cues that disagreed are kept, so a withheld answer can say why. */
+export interface CameraCue {
+  name: string;
+  value: number;
+  confidence: number;
+  detail: string;
+}
+/**
+ * A camera estimate plus the metric geometry that came with it. Optional
+ * fields so an estimate that abstained — and a session saved before the solve
+ * existed — are both valid values of this type.
+ */
+export interface CameraSolve extends CameraEstimate {
+  /** Distance from the camera to the shell centreline, metres. */
+  distance?: number | null;
+  /** Pixels per metre at the shell centreline. */
+  pxPerMetre?: number | null;
+  /** Principal point the solve used, pixels. */
+  principal?: { x: number; y: number } | null;
+  /** Focal length the solve used, pixels: what a lift projects through. */
+  focalPx?: number | null;
+  /** Residual of the seat-line fit, pixels. */
+  residual?: number | null;
+  /** The cues behind the answer, including the ones that argued with it. */
+  cues?: CameraCue[];
+}
+/**
+ * What produced a session's lifted angles, or why there are none.
+ *
+ * A lift is an inference about depth that no image can confirm on its own, so
+ * the session records which model ran, how many frames it was asked about, how
+ * many it placed, how many it refused and why. "No angles" is an answer with a
+ * reason, not a blank.
+ */
+export interface LiftProvenance {
+  ran: boolean;
+  /** Model description, when one ran. */
+  model?: string;
+  /** Why it did not run, or why the frames it refused were refused. */
+  reason?: string;
+  attempted?: number;
+  placed?: number;
+  refused?: number;
+  /** Median reprojection error over the placed frames, pixels. */
+  reprojection?: number | null;
+}
 export interface Correction {
   seat: number;
   time: number;
@@ -102,7 +182,20 @@ export interface Session {
   boat: Boat;
   frames: PoseFrame[];
   strokes: Stroke[];
-  camera: CameraEstimate;
+  camera: CameraSolve;
+  /** Boat and camera measurements the solve was given; absent on sessions
+   * saved before it existed, which is why the solve abstains on them. */
+  calibration?: BoatCalibration;
+  /**
+   * Normalized joint angles from a calibrated 3D lift, one row per entry of
+   * `frames`, in the same order. Absent when the lift did not run or the camera
+   * was not solved, and on sessions saved before it existed. Every value in a
+   * row is either an angle in the boat's frame or a withheld metric with its
+   * reason; nothing here is an observation of depth.
+   */
+  angles?: AngleFrame[];
+  /** What produced `angles`, or why there are none. */
+  lift?: LiftProvenance;
   corrections: Correction[];
   warnings: string[];
   model: string;

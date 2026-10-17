@@ -15,6 +15,7 @@ The app imports local `.onnx` files; it does not execute Python or send video to
 ## Supported contracts
 
 ### YOLOX
+
 - Input float32 NCHW `[1,3,S,S]`, square fixed input (usually 640).
 - Raw **BGR** 0–255; top-left letterbox with padding value 114.
 - Output `[1,N,85]`: raw grid-relative x/y and log-width/height, objectness and 80 class scores; person class index 0.
@@ -23,12 +24,14 @@ The app imports local `.onnx` files; it does not execute Python or send video to
 - A [YOLOX-Nano COCO ONNX](https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/yolox_nano.onnx) was downloaded to an ignored private directory for local evaluation. Static metadata shows `[1,3,416,416]` → `[1,3549,85]` with raw-grid output; this appears compatible with the adapter's size-derived grid decode and raw BGR/114 letterbox. After URL-specific local approval it ran successfully on the full clip with the COCO-17 model, though detection and pose accuracy are **not** benchmark-validated. No separate weight-license notice was found; it is not bundled or redistributed.
 
 ### YOLOv8 / YOLO11 (optional detector adapter)
+
 - RGB 0–1, square NCHW input, top-left letterbox.
 - Output `[1,84,N]` with decoded center-x/y/width/height and class scores; no objectness channel, no embedded NMS.
 - End-to-end `[1,N,6]` or YOLO26 exports are rejected.
 - Review Ultralytics licensing separately; weights are not bundled here.
 
 ### SimCC pose (COCO-17 body or COCO-WholeBody-133)
+
 - Select **Pose joint layout** explicitly: 133 remains the default; 17 requires a separately imported local trained COCO-17 ONNX file. The cached/downloadable DWPose whole-body weights are never used in body-only mode.
 - Input `[1,3,H,W]`; default whole-body **W=288, H=384**, while a compatible small body-only export may use **W=192, H=256**. Settings must match the actual graph.
 - RGB normalization: mean `[123.675,116.28,103.53]`, standard deviation `[58.395,57.12,57.375]`.
@@ -37,71 +40,108 @@ The app imports local `.onnx` files; it does not execute Python or send video to
 - Argmax plus local parabolic sub-pixel refinement. Confidence uses minimum axis peak clipped to [0,1], not a calibrated probability. Crop geometry, normalization and confidence require empirical validation for every new export. Taking the first 17 outputs of a 133-joint graph **does not speed up its backbone**.
 
 ### Heatmap pose exports
+
 - Same image preprocessing; one `[1,J,Hh,Wh]` heatmap tensor with J matching the selected 17/133 layout.
 - Peak + local 2D parabolic refinement and inverse crop mapping.
 - The export must match the exact non-UDP coordinate convention. Generic ViTPose body checkpoints/UDP exports are not automatically compatible.
 - Current TTA fuses **decoded coordinates**, weighted by confidence, and penalizes inter-pass disagreement. It does **not** yet perform full heatmap-space multi-scale fusion or DARK refinement.
 
 ### TTA
+
 Two crop scales (1.25, 1.5) × original/flipped input. Preserve aspect ratio and swap all body, foot, facial, and hand mirror indices. Keep per-joint provenance and confidence. Padded crops extend beyond the image with black padding. Per-frame detection plus per-person four-pass pose inference is deliberately slow.
 
-The *Adaptive* policy (default) runs the first pass alone and accepts it when every gated body joint reaches 0.3 and the body mean reaches 0.5; otherwise the same four passes run and fuse. Joints the session declares hidden are not gated: with *Feet in view: Hidden by the hull* (the on-water default) that is the ankles, which no extra pass can reveal.
+The _Adaptive_ policy (default) runs the first pass alone and accepts it when every gated body joint reaches 0.3 and the body mean reaches 0.5; otherwise the same four passes run and fuse. Joints the session declares hidden are not gated: with _Feet in view: Hidden by the hull_ (the on-water default) that is the ankles, which no extra pass can reveal.
 
 ### Detector cadence
 
-*Every frame* is the default for fresh person detection. Experimental *Auto* starts with full detection and only attempts to reuse short-lived crops when measured detector cost dominates pose, with an anchor at least every third decoded frame. The next frame's crop comes from a completed, confidence-gated seat pose; weak/ambiguous crops trigger fresh detection and a same-frame pose retry. Every decoded frame with a valid seat still runs inference with the selected pose model. A predicted **box** is not a fresh person observation: each frame records `boxSource` and `detectorAge`, and identity confidence is capped by that age. Existing sessions without those optional fields were made before cadence. *Every frame* restores full detection for comparisons. This policy is not validated for real-weight seat identity, hands or timing accuracy on rowing footage.
+_Every frame_ is the default for fresh person detection. Experimental _Auto_ starts with full detection and only attempts to reuse short-lived crops when measured detector cost dominates pose, with an anchor at least every third decoded frame. The next frame's crop comes from a completed, confidence-gated seat pose; weak/ambiguous crops trigger fresh detection and a same-frame pose retry. Every decoded frame with a valid seat still runs inference with the selected pose model. A predicted **box** is not a fresh person observation: each frame records `boxSource` and `detectorAge`, and identity confidence is capped by that age. Existing sessions without those optional fields were made before cadence. _Every frame_ restores full detection for comparisons. This policy is not validated for real-weight seat identity, hands or timing accuracy on rowing footage.
 
 ### Hidden feet
-On the water the feet (ankles 15–16, feet 17–22) are below the gunwale for the whole clip, so whatever the model returns for them is a guess. When the session declares them hidden, the worker replaces them with missing joints flagged *Feet hidden by the hull* before tracking, and stroke cycles use hips and knees only. A manually placed foot point is kept. Choose *Visible* for ergometer or overhead footage. A COCO-17 model may estimate visible ankles 15–16 but **never supplies toe/heel joints 17–22**, regardless of camera setup; those slots stay unavailable unless manually labeled.
+
+On the water the feet (ankles 15–16, feet 17–22) are below the gunwale for the whole clip, so whatever the model returns for them is a guess. When the session declares them hidden, the worker replaces them with missing joints flagged _Feet hidden by the hull_ before tracking, and stroke cycles use hips and knees only. A manually placed foot point is kept. Choose _Visible_ for ergometer or overhead footage. A COCO-17 model may estimate visible ankles 15–16 but **never supplies toe/heel joints 17–22**, regardless of camera setup; those slots stay unavailable unless manually labeled.
+
+### 3D lift (optional, and nothing to download)
+
+A normalized angle needs a pose in the boat's frame, and a 2D model cannot give
+one: no monocular image determines depth. `src/core/lift.ts` places a learned 3D
+lift against the camera solve, so the contract a model has to meet is narrow and
+checked rather than assumed:
+
+- **Output**: 17 joints in the COCO body order (the first 17 of COCO-WholeBody),
+  camera-frame **metres**, **root relative**, x to the image's right, y **up**, z
+  **away from** the camera. Interleaved `[1, 17, 3]` or planar `[1, 3, 17]`; a
+  per-joint confidence tensor of length 17 is used when present. Anything else is
+  refused naming the shape that arrived.
+- **Input**: the same CHW float32 crop raster the pose model gets, at the
+  configured pose input size, never flipped.
+- **What is checked**: the lifted pose is scaled and slid to land on the observed
+  keypoints through the calibrated camera. A reprojection worse than 6% of the
+  crop height is refused; a fitted scale implying a thigh outside 30–62 cm is
+  refused; a joint the 2D pipeline discarded is never lifted.
+- **What cannot be checked**: the sign of the depth axis. A rower is nearly
+  planar and nearly parallel to the image plane, so a z-flipped model reprojects
+  almost as well and its interior angles are unchanged. Verify the convention
+  once against a known-good release before trusting a new one.
+
+No lift weights are bundled and no download URL is configured, because no
+rowing-validated 3D lift has been evaluated: import a `.onnx` under _Principal
+point and 3D lift_ in the setup panel. Without one, and without a seat spacing, a
+lens and a level confirmation, normalized angles stay withheld and the session
+records which of those was missing. The lift's own accuracy is ROADMAP milestone
+8's gate, and it needs an annotated rowing benchmark, not a simulator.
+
+### Knees at the finish
+
+The knee is the joint stroke timing is built on, and it is the one the boat covers: with the legs flat it drops to the gunwale, and in a side view the loom crosses the legs on the way out. A whole-body model does not say it cannot see it — it reports the hull edge (a knee pinned to the lowest line it could lie on) or the shaft (a knee dragged up onto the oar), at confidences that overlap a genuinely visible knee's. So the worker judges each seat's knees against that seat's own clear view of them near the catch, where neither occluder reaches: below that band, a stretch of frames measuring weaker than the reference — lower confidence, or an apparent thigh too far off the seat's own — is discarded as occlusion and flagged _Knee behind the gunwale or the oar at the finish_. A discarded knee is a missing point: not tracked, not gap-filled, not drawn, and not counted as evidence the model failed to find; the finish is timed from the bridged trough instead. The catch end of the stroke keeps exactly what the model reported, a manually placed knee is kept, footage whose knees the model already drops is left alone, and with _Feet in view: Visible_ (ergometer, overhead) the pass does not run at all. A model does not answer the same covered knee the same way twice, so a crossing it answers inconsistently — a guess on one frame, nothing on the next — is still read as one window, and a crossing it dropped throughout is left alone: there is nothing in it to discard. Both occluders and all three behaviours are simulated and pinned in `tests/knees.test.ts`; what a real weight does with a covered knee, and how far off it puts it, is not measured.
 
 ## Automatic download and cache
 
 Weights are **never** committed to Git or bundled in the Pages build (`*.onnx` is ignored; `dist/` contains only the app). Instead, the app loads each model in this order:
 
-1. **Local file** chosen under *Models & processing* — always wins.
+1. **Local file** chosen under _Models & processing_ — always wins.
 2. **Cache Storage** (`row-analyzer-models-v1`) — a previous successful download, re-validated for exact size and ONNX header; a corrupt entry is evicted.
 3. **Streamed download** from the configured URL, with a live progress bar. The file must match the expected byte length (and SHA-256 when configured) before it is cached.
 4. Otherwise an actionable error and the local-file import path.
 
-The automatic pose cache/download specification is **133-joint DWPose only**. In 17-joint mode a local, compatible COCO-17 file is mandatory; the cached whole-body model is never substituted. The session keeps 133 slots for backward-compatible exports, with 17–132 marked *not provided by model* unless manually labeled.
+The automatic pose cache/download specification is **133-joint DWPose only**. In 17-joint mode a local, compatible COCO-17 file is mandatory; the cached whole-body model is never substituted. The session keeps 133 slots for backward-compatible exports, with 17–132 marked _not provided by model_ unless manually labeled.
 
 Build-time configuration (repository **variables**, passed by the Pages workflow; not secrets):
 
-| Variable | Meaning |
-| --- | --- |
-| `VITE_YOLOX_URL` | HTTPS URL of `yolox_l.onnx` |
-| `VITE_DWPOSE_URL` | HTTPS URL of `dw-ll_ucoco_384.onnx` |
+| Variable                                | Meaning                                                                                                                                          |
+| --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `VITE_YOLOX_URL`                        | HTTPS URL of `yolox_l.onnx`                                                                                                                      |
+| `VITE_DWPOSE_URL`                       | HTTPS URL of `dw-ll_ucoco_384.onnx`                                                                                                              |
 | `VITE_YOLOX_BYTES`, `VITE_DWPOSE_BYTES` | Expected exact sizes. Defaults are the Drive metadata sizes (216,746,733 and 134,399,116 bytes). `0` disables the size check (test builds only). |
 
-Requirements for a download URL: HTTPS, CORS readable from the Pages origin (`Access-Control-Allow-Origin`), and the exact file bytes. Google Drive sharing links are generally **not** CORS-readable from another origin, so host the files somewhere that is, after confirming the licenses allow redistribution to your own users. Verify CORS with a browser before relying on it. With no URL set, the app shows *No download URL in this build* and the local-file import still works.
+Requirements for a download URL: HTTPS, CORS readable from the Pages origin (`Access-Control-Allow-Origin`), and the exact file bytes. Google Drive sharing links are generally **not** CORS-readable from another origin, so host the files somewhere that is, after confirming the licenses allow redistribution to your own users. Verify CORS with a browser before relying on it. With no URL set, the app shows _No download URL in this build_ and the local-file import still works.
 
-Downloaded data is model weights only. Video frames and keypoints are never cached. *Clear cached models* in the dialog removes them.
+Downloaded data is model weights only. Video frames and keypoints are never cached. _Clear cached models_ in the dialog removes them.
 
 Each ONNX session also runs a shape-level contract check when it is created (`src/core/compat.ts`): YOLOX `[1,N,85]` or YOLOv8/11 `[1,84,N]`, square detector input, DWPose input matching the configured width/height, and the **selected 17- or 133-joint** SimCC/heatmap outputs. Symbolic metadata is confirmed with a zero-input inference before video decoding. A failed check stops analysis before any frame is decoded. Passing this check confirms the I/O contract only, not accuracy.
 
 ## Browser runtime
 
-WebGPU is attempted first (unless *Force WASM* is set) and must pass a warm-up inference on a zero tensor before any frame is decoded: sessions that create successfully can still fail on the first real run (unsupported operators, GPU buffer limits on large fp32 models, driver blocklists), and that failure falls back to WASM automatically with the reason recorded in the session warnings instead of aborting the analysis. Adapter creation fails outright on many Chrome-on-Linux, Firefox, and Safari setups, so the reason is always recorded and shown: no `navigator.gpu`, no adapter at all, only a software adapter, or a specific ONNX Runtime error.
+WebGPU is attempted first (unless _Force WASM_ is set) and must pass a warm-up inference on a zero tensor before any frame is decoded: sessions that create successfully can still fail on the first real run (unsupported operators, GPU buffer limits on large fp32 models, driver blocklists), and that failure falls back to WASM automatically with the reason recorded in the session warnings instead of aborting the analysis. Adapter creation fails outright on many Chrome-on-Linux, Firefox, and Safari setups, so the reason is always recorded and shown: no `navigator.gpu`, no adapter at all, only a software adapter, or a specific ONNX Runtime error.
 
 ### WASM build selection (this was the "GPU never works" bug)
 
 ONNX Runtime Web ships one JavaScript entry point per execution-provider set, and **each entry expects exactly one of the prebuilt WASM modules**. The pairing is compiled into the entry, not chosen at runtime:
 
-| Entry point | WASM module it loads | Exposes the WebGPU bridge |
-| --- | --- | --- |
-| `onnxruntime-web/webgpu` | `ort-wasm-simd-threaded.asyncify` | yes (`webgpuInit`) |
-| `onnxruntime-web` / `/all` | `ort-wasm-simd-threaded.jsep` | no |
-| `onnxruntime-web/wasm` | `ort-wasm-simd-threaded` | no |
-| `onnxruntime-web/jspi` | `ort-wasm-simd-threaded.jspi` | yes (`webgpuInit`) |
+| Entry point                | WASM module it loads              | Exposes the WebGPU bridge |
+| -------------------------- | --------------------------------- | ------------------------- |
+| `onnxruntime-web/webgpu`   | `ort-wasm-simd-threaded.asyncify` | yes (`webgpuInit`)        |
+| `onnxruntime-web` / `/all` | `ort-wasm-simd-threaded.jsep`     | no                        |
+| `onnxruntime-web/wasm`     | `ort-wasm-simd-threaded`          | no                        |
+| `onnxruntime-web/jspi`     | `ort-wasm-simd-threaded.jspi`     | yes (`webgpuInit`)        |
 
 The app previously pinned the **jsep** module via `env.wasm.wasmPaths` while importing the **webgpu** entry, which asks the module for `webgpuInit` — a function that only exists in the asyncify/jspi builds. Result: `WebGPU failed for <model> (no available backend found. ERR: [webgpu] TypeError: ...webgpuInit is not a function)` on every browser and device, because it was a static file mismatch, not a hardware limit. `src/core/ortRuntime.ts` now pins the matching pair, `tests/ortRuntime.test.ts` re-derives the table above from the installed package and fails if an upgrade changes it, and WebGPU runs use the asyncify build while WASM-only runs use the smaller plain build (about 14 MB instead of 27 MB, and no asyncify overhead in the WASM pool).
 
-A probed adapter is passed to ONNX Runtime through `env.webgpu.adapter`, so the library does not request a second, possibly different adapter. A *software* adapter (SwiftShader) is detected and reported; it is not used by default because the parallel WASM pool is usually faster. If a GPU session dies mid-run, that session is rebuilt on WASM and the run continues with a recorded warning instead of discarding the decoded frames.
+A probed adapter is passed to ONNX Runtime through `env.webgpu.adapter`, so the library does not request a second, possibly different adapter. A _software_ adapter (SwiftShader) is detected and reported; it is not used by default because the parallel WASM pool is usually faster. If a GPU session dies mid-run, that session is rebuilt on WASM and the run continues with a recorded warning instead of discarding the decoded frames.
 
 WASM inference is parallelised two ways (see `src/core/parallel.ts` for the exact policy):
 
-1. **Pose-worker pool (works everywhere, no page setup).** Pose inference dominates runtime (up to 4 TTA passes × every detected person, per frame), and every pass is independent. The main thread spawns N pose workers (Auto: one per core minus one, capped at 4; configurable under *Models & settings → Parallel pose workers*) and connects each directly to the analysis worker over a `MessageChannel`, so tensors never relay through the UI thread. Each worker owns a WASM pose session; jobs are routed least-busy-first and results are reassembled in pass order before TTA fusion. If a worker fails to start or dies mid-run, the analysis continues on the remaining workers or on a local session in the analysis worker — reduced speed is reported, never hidden. Cost: each pool worker loads its own copy of the pose model (~134 MB for DWPose-l), so raising the worker count trades RAM for speed.
-2. **Threaded WASM (needs cross-origin isolation).** ONNX Runtime's `numThreads > 1` requires `SharedArrayBuffer`, which browsers only grant on cross-origin-isolated pages (COOP + COEP headers); without isolation ORT silently clamps to 1 thread. Local dev/preview sends the headers via Vite; the GitHub Pages deployment gets them from `public/coi-serviceworker.js`, a service worker that re-serves same-origin responses with COOP/COEP after one automatic reload. When isolation is active, the core budget is split across the pool (e.g. 8 cores → 4 workers × 2 threads); when it is not, each session runs single-threaded and the pool provides the parallelism. The active configuration is shown in *Models & settings* and recorded in each session's `provider` string.
+1. **Pose-worker pool (works everywhere, no page setup).** Pose inference dominates runtime (up to 4 TTA passes × every detected person, per frame), and every pass is independent. The main thread spawns N pose workers (Auto: one per core minus one, capped at 4; configurable under _Models & settings → Parallel pose workers_) and connects each directly to the analysis worker over a `MessageChannel`, so tensors never relay through the UI thread. Each worker owns a WASM pose session; jobs are routed least-busy-first and results are reassembled in pass order before TTA fusion. If a worker fails to start or dies mid-run, the analysis continues on the remaining workers or on a local session in the analysis worker — reduced speed is reported, never hidden. Cost: each pool worker loads its own copy of the pose model (~134 MB for DWPose-l), so raising the worker count trades RAM for speed.
+2. **Threaded WASM (needs cross-origin isolation).** ONNX Runtime's `numThreads > 1` requires `SharedArrayBuffer`, which browsers only grant on cross-origin-isolated pages (COOP + COEP headers); without isolation ORT silently clamps to 1 thread. Local dev/preview sends the headers via Vite; the GitHub Pages deployment gets them from `public/coi-serviceworker.js`, a service worker that re-serves same-origin responses with COOP/COEP after one automatic reload. When isolation is active, the core budget is split across the pool (e.g. 8 cores → 4 workers × 2 threads); when it is not, each session runs single-threaded and the pool provides the parallelism. The active configuration is shown in _Models & settings_ and recorded in each session's `provider` string.
 
 The detector runs once per frame in the analysis worker (with the full thread budget when isolated, since the pool is idle at that point). Video decode, detection, and per-frame ordering remain sequential; tracking still consumes frames in timestamp order exactly as before. Model weights are loaded into memory for each analysis run and may be kept in Cache Storage as described above. Large/huge transformers may exceed GPU/storage-buffer/browser memory limits; compatible ONNX operators alone do not guarantee feasibility.
 

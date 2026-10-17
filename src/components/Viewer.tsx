@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Play,
   Pause,
@@ -18,6 +18,8 @@ import type {
 } from "../core/types";
 import { colors } from "../core/types";
 import { bones, jointNames } from "../core/keypoints";
+import { OCCLUDED_KNEE_FLAG } from "../core/occlusion";
+import { KNEE_JOINTS } from "../core/knees";
 export const clock = (s: number) =>
   `${Math.floor(s / 60)
     .toString()
@@ -73,6 +75,19 @@ export default function Viewer(p: Props) {
   const demo = p.session?.demo;
   const width = p.livePreview?.width || p.session?.width || sourceSize.width,
     height = p.livePreview?.height || p.session?.height || sourceSize.height;
+  // Whether this run discarded any knee as gunwale or loom occlusion
+  // (core/knees.ts). Session-wide like the feet chip beside it: the knee is
+  // covered for part of every cycle, so the answer is a property of the
+  // footage, not of the frame being scrubbed to.
+  const kneesOccluded = useMemo(
+    () =>
+      p.session?.frames.some((f) =>
+        KNEE_JOINTS.some((j) =>
+          f.points[j]?.flags?.includes(OCCLUDED_KNEE_FLAG),
+        ),
+      ) ?? false,
+    [p.session],
+  );
   const duration = p.session?.duration || p.duration || 1;
   useEffect(() => {
     setPlaying(false);
@@ -575,6 +590,12 @@ export default function Viewer(p: Props) {
           <span title="Feet are strapped to the stretcher below the gunwale, so ankle and foot keypoints would only be model guesses. They are not estimated; change this under Session setup → Feet in view.">
             <i className="hidden-joint" />
             Feet hidden by hull · not estimated
+          </span>
+        )}
+        {kneesOccluded && (
+          <span title="With the legs flat the knee drops to the gunwale and the loom crosses it, so a pose model can only guess it — pinned to the hull edge or dragged onto the shaft. Those answers are discarded and marked missing with a reason: not tracked, not counted as evidence, not drawn as observations. The catch end of the stroke is untouched and each finish is timed from the bridged trough.">
+            <i className="hidden-joint" />
+            Knee behind hull or oar at the finish · guesses discarded
           </span>
         )}
         <small>

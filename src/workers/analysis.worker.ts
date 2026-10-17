@@ -22,8 +22,18 @@ import {
   recoverOcclusion,
   suppressHiddenJoints,
 } from "../core/occlusion";
+import { describeKneeOcclusion, discardOccludedKnees } from "../core/knees";
 import { segmentStrokes } from "../core/strokes";
-import { estimateCamera } from "../core/geometry";
+import { solveAllowsAngles, solveCamera } from "../core/camera";
+import {
+  parseLiftOutput,
+  placeLift,
+  type LiftModel,
+  type LiftResult,
+  type RawTensor,
+} from "../core/lift";
+import { jointAngles, withheldAngles, type AngleFrame } from "../core/angles";
+import { median } from "../core/geometry";
 import { FrameSource, Rasterizer, transferCrop } from "../core/preprocess";
 import { SequentialPipeline } from "../core/queue";
 import { StageTimer, buildReport } from "../core/perf";
@@ -48,6 +58,9 @@ import {
 import { PoseWorkerPool, type PoseJob } from "../core/pool";
 import type {
   Boat,
+  BoatCalibration,
+  CameraSolve,
+  LiftProvenance,
   ModelSettings,
   Point,
   PoseFrame,
@@ -63,6 +76,12 @@ interface Job {
   boat: Boat;
   /** Plan computed by the main thread (it also sizes the worker pool). */
   parallel?: ParallelPlan;
+  /** What the user measured about the boat and the lens. Without it the camera
+   * solve abstains and normalized angles stay withheld. */
+  calibration?: BoatCalibration;
+  /** Optional 3D lift weights, imported locally. No download is configured for
+   * this model: no rowing-validated lift exists to distribute yet. */
+  lift?: File | null;
 }
 
 const send = (type: string, payload: unknown) => postMessage({ type, payload });
@@ -988,6 +1007,198 @@ async function run(job: Job) {
      * works on the previous one. */
     const canOverlap = () => Boolean(pool && poolAlive);
 
+    /**
+     * The lift pass: a second decode of the same clip.
+     *
+     * The camera solve needs every frame's hips before any single frame can be
+     * lifted, and holding thousands of crop rasters in memory is not an option,
+     * so the clip is decoded twice when — and only when — a solve and a lift
+     * model both exist. Frames are matched to the tracked poses by timestamp,
+     * walking both in order, and a frame the second decode did not produce is
+     * reported as refused rather than silently absent.
+     */
+    async function liftPass(solve: CameraSolve): Promise<{
+      angles?: AngleFrame[];
+      provenance: LiftProvenance;
+    }> {
+      const none = (reason: string): LiftProvenance => ({
+        ran: false,
+        reason,
+        attempted: 0,
+        placed: 0,
+        refused: 0,
+        reprojection: null,
+      });
+      if (!solveAllowsAngles(solve))
+        return {
+          provenance: none(
+            solve.reason ||
+              "The camera is not solved, so there is no boat frame to lift into.",
+          ),
+        };
+      if (!job.lift)
+        return {
+          provenance: none(
+            `the camera is solved (${Math.abs(solve.azimuth!).toFixed(1)}° off ` +
+              `square, ${Math.round(solve.confidence * 100)}% confidence) but no ` +
+              `3D lift weights were provided, so normalized angles are withheld. ` +
+              `Import a lift model under Models & processing; none is bundled, ` +
+              `because no rowing-validated one exists yet.`,
+          ),
+        };
+
+      let liftSession: ort.InferenceSession;
+      try {
+        liftSession = await ort.InferenceSession.create(
+          await job.lift.arrayBuffer(),
+          {
+            executionProviders: job.settings.wasm
+              ? ["wasm"]
+              : ["webgpu", "wasm"],
+          },
+        );
+      } catch (e) {
+        return {
+          provenance: none(`the 3D lift model would not load: ${errText(e)}`),
+        };
+      }
+      const inputName = liftSession.inputNames[0];
+      if (!inputName)
+        return { provenance: none("the 3D lift model declares no input.") };
+      const model: LiftModel = async (input) => {
+        const outputs = await liftSession.run({
+          [inputName]: new ort.Tensor("float32", input.raster, [
+            1,
+            3,
+            input.height,
+            input.width,
+          ]),
+        });
+        const raw: Record<string, RawTensor> = {};
+        for (const [name, t] of Object.entries(outputs))
+          raw[name] = {
+            dims: t.dims as number[],
+            data: t.data as ArrayLike<number>,
+          };
+        const parsed = parseLiftOutput(raw);
+        if ("error" in parsed) throw Error(parsed.error);
+        return parsed.output;
+      };
+
+      send("status", "Lifting poses into boat coordinates…");
+      const results = new Array<LiftResult | undefined>(recovered.length);
+      const order = recovered
+        .map((f, i) => ({ time: f.time, i }))
+        .sort((a, b) => a.time - b.time);
+      const gaps = timestamps
+        .slice(1)
+        .map((t, i) => t - timestamps[i]!)
+        .filter((d) => d > 0);
+      const tolerance = (median(gaps) ?? 1 / 30) / 2;
+      let cursor = 0,
+        attempted = 0,
+        decoded = 0;
+      await decodeVideo(
+        job.file,
+        async (frame, time) => {
+          while (
+            cursor < order.length &&
+            order[cursor]!.time < time - tolerance
+          )
+            cursor++;
+          const here: number[] = [];
+          for (
+            let k = cursor;
+            k < order.length && order[k]!.time <= time + tolerance;
+            k++
+          )
+            here.push(order[k]!.i);
+          if (!here.length) return;
+          const source = await FrameSource.own(frame.clone());
+          try {
+            for (const i of here) {
+              const poseFrame = recovered[i]!;
+              attempted++;
+              try {
+                const output = await model({
+                  raster: rasterPose(source, poseFrame.box, false),
+                  width: job.settings.width,
+                  height: job.settings.height,
+                });
+                results[i] = placeLift(output, poseFrame, solve, {
+                  width: meta.width,
+                  height: meta.height,
+                });
+              } catch (e) {
+                results[i] = {
+                  joints: [],
+                  reprojection: null,
+                  scale: null,
+                  placement: null,
+                  withheld: `The lift failed on this frame: ${errText(e)}`,
+                };
+              }
+            }
+          } finally {
+            source.dispose();
+            decoded++;
+            if (decoded % 25 === 0)
+              send(
+                "progress",
+                0.98 +
+                  0.019 * Math.min(1, decoded / Math.max(1, timestamps.length)),
+              );
+          }
+        },
+        () => {},
+      );
+
+      let placed = 0,
+        refused = 0;
+      const reasons = new Map<string, number>();
+      const errors: number[] = [];
+      const angles: AngleFrame[] = recovered.map(
+        (f: PoseFrame, i: number): AngleFrame => {
+          const r = results[i];
+          if (!r || r.withheld) {
+            refused++;
+            const why =
+              r?.withheld ?? "This frame was not decoded a second time.";
+            reasons.set(why, (reasons.get(why) ?? 0) + 1);
+            return {
+              time: f.time,
+              seat: f.seat,
+              reprojection: null,
+              angles: withheldAngles(why),
+            };
+          }
+          placed++;
+          if (r.reprojection !== null) errors.push(r.reprojection);
+          return {
+            time: f.time,
+            seat: f.seat,
+            reprojection: r.reprojection,
+            angles: jointAngles(r.joints, r.reprojection),
+          };
+        },
+      );
+      const worst = [...reasons.entries()].sort((a, b) => b[1] - a[1])[0];
+      return {
+        angles,
+        provenance: {
+          ran: true,
+          model: `${job.lift.name}; ${liftSession.outputNames.length} output tensors`,
+          reason: refused
+            ? (worst?.[0] ?? "Some frames were refused.")
+            : undefined,
+          attempted,
+          placed,
+          refused,
+          reprojection: median(errors),
+        },
+      };
+    }
+
     const meta = await decodeVideo(
       job.file,
       async (frame, time, info) => {
@@ -1058,13 +1269,44 @@ async function run(job: Job) {
       () => {},
     );
     await pipeline.drain();
-    send("status", "Recovering short gaps and segmenting stroke cycles…");
+    send("status", "Discarding occluded knees, recovering short gaps…");
+    // Before the gap filler: a discarded knee is a flagged missing point, and
+    // flagged points are never interpolated (core/occlusion.ts). Filling one
+    // would turn the guess this pass just removed into a straight line between
+    // the frames on either side of the hull.
+    const knees = await timer.timeAsync("knees", async () =>
+      discardOccludedKnees(frames, job.boat),
+    );
+    const kneeNote = describeKneeOcclusion(knees);
+    if (kneeNote) notes.push(kneeNote);
     const recovered = await timer.timeAsync("recover", async () =>
-      recoverOcclusion(frames),
+      recoverOcclusion(knees.frames),
     );
     const strokes = await timer.timeAsync("strokes", async () =>
       segmentStrokes(recovered),
     );
+
+    // The camera, from the crew's own seat line: hips averaged over the clip at
+    // a spacing the user measured, through a lens the user named. It abstains
+    // when the cues do not agree, and says why (core/camera.ts).
+    const camera = await timer.timeAsync("camera", async () =>
+      solveCamera(recovered, job.boat, job.calibration ?? {}, {
+        width: meta.width,
+        height: meta.height,
+      }),
+    );
+    const lift = await timer.timeAsync("lift", () => liftPass(camera));
+    if (lift.provenance.ran)
+      notes.push(
+        `3D lift: ${lift.provenance.placed} of ${lift.provenance.attempted} poses placed against the solved camera` +
+          (lift.provenance.refused
+            ? `, ${lift.provenance.refused} refused (${lift.provenance.reason ?? "see the per-frame reasons"})`
+            : "") +
+          `. Lifted joints are inferences about depth, never observations.`,
+      );
+    else if (lift.provenance.reason)
+      notes.push(`3D lift: ${lift.provenance.reason}`);
+
     const seconds = (performance.now() - startedAt) / 1000;
     const performance_ = buildReport(timer, {
       frames: processed,
@@ -1098,9 +1340,10 @@ async function run(job: Job) {
       frames: recovered,
       strokes,
       performance: performance_,
-      camera: estimateCamera(
-        recovered.slice(0, job.boat.seats).map((f) => f.points[11]),
-      ),
+      camera,
+      calibration: job.calibration ?? undefined,
+      angles: lift.angles,
+      lift: lift.provenance,
       corrections: [],
       warnings: [
         ...(timestamps.length !== meta.samples.length
@@ -1116,7 +1359,9 @@ async function run(job: Job) {
             ]),
         "Experimental tracking: review seat identity and keypoints before coaching.",
         "Catch/finish events are leg-compression proxies from thigh (hip-to-knee) elevation, not directly observed blade entry/release.",
-        "3D camera normalization, oar tracking, and depth-dependent biomechanics are not validated and are withheld.",
+        lift.angles
+          ? "Normalized joint angles come from a learned 3D lift placed against a seat-line camera solve. They are inferences about depth, not observations; the solve's cues are in the report. Oar angles, handle path, boat set, trunk twist and split per 500 m remain withheld."
+          : `3D angles are withheld: ${lift.provenance.reason ?? camera.reason} Oar tracking and depth-dependent biomechanics are not validated and stay withheld.`,
       ],
       poseJoints: job.settings.poseJoints,
       model: `${job.detector.name} + ${job.pose.name}; ${job.settings.poseJoints}-joint ${job.settings.poseJoints === 17 ? "COCO body" : "COCO WholeBody"}; ${job.settings.width}×${job.settings.height}; ${describeTta(job.settings.tta)}; ${job.settings.detectorCadence === "auto" ? "guarded detector cadence" : "every-frame detection"}`,
