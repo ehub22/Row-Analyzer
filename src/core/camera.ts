@@ -60,7 +60,7 @@ import type {
 } from "./types";
 import { seen } from "./occlusion";
 import { HIP_JOINTS } from "./strokes";
-import { median } from "./geometry";
+import { median, solveLinear3 } from "./geometry";
 
 /** Hips are the joint the seat line is read from: the one joint that stays
  * above the gunwale all stroke, and the seat's own position along the shell. */
@@ -174,7 +174,7 @@ export function fitSeatLine(
       y[r] += row[r] * target;
     }
   }
-  const x = solve3(A, y);
+  const x = solveLinear3(A, y);
   if (!x) return null;
   let sum = 0;
   for (let i = 0; i < n; i++) {
@@ -184,24 +184,6 @@ export function fitSeatLine(
     sum += d * d;
   }
   return { a: x[0], b: x[1], c: x[2], residual: Math.sqrt(sum / n) };
-}
-
-/** Gaussian elimination on a 3×3 system; null when it is singular. */
-function solve3(A: number[][], y: number[]): [number, number, number] | null {
-  const m = A.map((row, i) => [...row, y[i]]);
-  for (let col = 0; col < 3; col++) {
-    let pivot = col;
-    for (let r = col + 1; r < 3; r++)
-      if (Math.abs(m[r][col]) > Math.abs(m[pivot][col])) pivot = r;
-    if (Math.abs(m[pivot][col]) < 1e-12) return null;
-    [m[col], m[pivot]] = [m[pivot], m[col]];
-    for (let r = 0; r < 3; r++) {
-      if (r === col) continue;
-      const k = m[r][col] / m[col][col];
-      for (let c = col; c < 4; c++) m[r][c] -= k * m[col][c];
-    }
-  }
-  return [m[0][3] / m[0][0], m[1][3] / m[1][1], m[2][3] / m[2][2]];
 }
 
 const rad = (deg: number) => (deg * Math.PI) / 180;
@@ -473,7 +455,10 @@ export function solveCamera(
           cues.map((c) => `${c.name}: ${c.detail}`).join(" "),
     distance,
     pxPerMetre,
-    principal: { x: cx, y: imageSize.height / 2 },
+    // cy does not enter the azimuth — the seat line is a horizontal statement —
+    // but a lift projects through it, so the calibration's is carried here.
+    principal: { x: cx, y: calibration.cy ?? imageSize.height / 2 },
+    focalPx: f,
     residual: fit.residual,
     cues,
   };

@@ -136,6 +136,8 @@ export interface CameraSolve extends CameraEstimate {
   pxPerMetre?: number | null;
   /** Principal point the solve used, pixels. */
   principal?: { x: number; y: number } | null;
+  /** Focal length the solve used, pixels: what a lift projects through. */
+  focalPx?: number | null;
   /** Residual of the seat-line fit, pixels. */
   residual?: number | null;
   /** The cues behind the answer, including the ones that argued with it. */

@@ -38,6 +38,31 @@ export function angle3D(a: Vec3, b: Vec3, c: Vec3): number | null {
     : (Math.acos(clamp((u.x * v.x + u.y * v.y + u.z * v.z) / d, -1, 1)) * 180) /
         Math.PI;
 }
+/**
+ * Gaussian elimination on a 3×3 system; null when it is singular.
+ *
+ * Small enough to write out and shared by the camera solve's seat-line fit and
+ * the lift's scale fit, so neither carries its own copy.
+ */
+export function solveLinear3(
+  A: readonly (readonly number[])[],
+  y: readonly number[],
+): [number, number, number] | null {
+  const m = [0, 1, 2].map((i) => [...A[i]!, y[i]!]);
+  for (let col = 0; col < 3; col++) {
+    let pivot = col;
+    for (let r = col + 1; r < 3; r++)
+      if (Math.abs(m[r]![col]!) > Math.abs(m[pivot]![col]!)) pivot = r;
+    if (Math.abs(m[pivot]![col]!) < 1e-12) return null;
+    [m[col], m[pivot]] = [m[pivot]!, m[col]!];
+    for (let r = 0; r < 3; r++) {
+      if (r === col) continue;
+      const k = m[r]![col]! / m[col]![col]!;
+      for (let c = col; c < 4; c++) m[r]![c]! -= k * m[col]![c]!;
+    }
+  }
+  return [m[0]![3]! / m[0]![0]!, m[1]![3]! / m[1]![1]!, m[2]![3]! / m[2]![2]!];
+}
 export function scaleFromSegment(
   pixels: number,
   meters: number,
