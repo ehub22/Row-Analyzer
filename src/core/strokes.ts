@@ -28,8 +28,9 @@ export const withheld = (unit: string, reason: string): Metric => ({
 // the angle is in the image plane, so its *values* depend on camera azimuth,
 // but for a fixed camera its extrema (and therefore the timing) do not.
 
-/** COCO-WholeBody hips. */
-const HIPS: readonly number[] = [11, 12];
+/** COCO-WholeBody hips. Exported for the camera solve, which reads the seat
+ * line from them (core/camera.ts). */
+export const HIP_JOINTS: readonly number[] = [11, 12];
 /** [hip, knee] of each leg in the COCO-WholeBody layout. */
 export const THIGHS: readonly (readonly [number, number])[] = [
   [11, 13],
@@ -238,7 +239,7 @@ export function segmentStrokes(frames: PoseFrame[]): Stroke[] {
     if (values.length < 10) continue;
     const lo = quantile(values, 0.05),
       troughLine = lo + TROUGH_FRACTION * (quantile(values, 0.95) - lo);
-    const hipSeen = seq.map((f) => HIPS.some((j) => seen(f.points[j])));
+    const hipSeen = seq.map((f) => HIP_JOINTS.some((j) => seen(f.points[j])));
     /** Whether the knee at sample i is low enough for the hull to be hiding
      * it. Read on the sample's own elevation as well as on the smoothed one:
      * the sample a blind spot ends on is smoothed towards the flank it sits

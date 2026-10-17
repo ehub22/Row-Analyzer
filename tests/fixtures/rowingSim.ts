@@ -61,7 +61,7 @@ export function legExtension(phase: number) {
   return 1 - ease((phase - 0.55) / 0.45); // slide forward to the next catch
 }
 /** Trunk layback in degrees (negative = leaning towards the feet). */
-function trunkAngle(phase: number) {
+export function trunkAngle(phase: number) {
   if (phase < 0.12) return -28;
   if (phase < 0.38) return -28 + 50 * ease((phase - 0.12) / 0.26);
   if (phase < 0.45) return 22;
@@ -69,7 +69,7 @@ function trunkAngle(phase: number) {
   return -28;
 }
 /** Arm draw: 0 = arms straight, 1 = handle at the body. */
-function armDraw(phase: number) {
+export function armDraw(phase: number) {
   if (phase < 0.26) return 0;
   if (phase < 0.4) return ease((phase - 0.26) / 0.14);
   if (phase < 0.42) return 1;
